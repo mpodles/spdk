@@ -213,6 +213,7 @@ static int g_outstanding_commands;
 
 static bool g_latency_ssd_tracking_enable;
 static int g_latency_sw_tracking_level;
+static double g_latency_threshold_multiplier = 0.0; /* 0.0 means disabled */
 
 static bool g_zcopy = false;
 
@@ -1592,6 +1593,7 @@ task_complete(struct perf_task *task)
 	struct ns_worker_ctx	*ns_ctx;
 	uint64_t		tsc_diff;
 	struct ns_entry		*entry;
+	double			latency_us, avg_latency_us, threshold_us;
 
 	ns_ctx = task->ns_ctx;
 	entry = ns_ctx->entry;
@@ -1607,6 +1609,22 @@ task_complete(struct perf_task *task)
 	}
 	if (spdk_unlikely(g_latency_sw_tracking_level > 0)) {
 		spdk_histogram_data_tally(ns_ctx->histogram, tsc_diff);
+	}
+
+	/* Check for high latency requests if threshold is enabled */
+	if (spdk_unlikely(g_latency_threshold_multiplier > 0.0 && ns_ctx->stats.io_completed > 10)) {
+		latency_us = (double)tsc_diff * 1000 * 1000 / g_tsc_rate;
+		avg_latency_us = ((double)ns_ctx->stats.total_tsc / ns_ctx->stats.io_completed) * 1000 * 1000 / g_tsc_rate;
+		threshold_us = avg_latency_us * g_latency_threshold_multiplier;
+
+		if (latency_us > threshold_us) {
+			fprintf(stderr, "[HIGH_LATENCY] %s (core %u): latency=%.2fus, avg=%.2fus, threshold=%.2fus (%.1fx avg), "
+				"op=%s, qd=%" PRIu64 "\n",
+				entry->name, spdk_env_get_current_core(),
+				latency_us, avg_latency_us, threshold_us, latency_us / avg_latency_us,
+				task->is_read ? "READ" : "WRITE",
+				ns_ctx->current_queue_depth);
+		}
 	}
 
 	if (spdk_unlikely(entry->md_size > 0)) {
@@ -2032,6 +2050,7 @@ usage(char *program_name)
 	printf("\t-L, --enable-sw-latency-tracking enable latency tracking via sw, default: disabled\n");
 	printf("\t\t-L for latency summary, -LL for detailed histogram\n");
 	printf("\t-l, --enable-ssd-latency-tracking enable latency tracking via ssd (if supported), default: disabled\n");
+	printf("\t--latency-threshold <multiplier> log requests when latency exceeds multiplier times average (e.g., 3.0 for 3x avg), default: disabled\n");
 	printf("\t-N, --no-shst-notification no shutdown notification process for controllers, default: disabled\n");
 	printf("\t-Q, --continue-on-error <val> Do not stop on error. Log I/O errors every N times (default: 1)\n");
 	spdk_log_usage(stdout, "\t-T");
@@ -2517,6 +2536,8 @@ static const struct option g_perf_cmdline_opts[] = {
 	{"disable-zcopy-recv",			required_argument,	NULL, PERF_DISABLE_ZCOPY_RECV},
 #define PERF_ENABLE_ZCOPY_RECV	272
 	{"enable-zcopy-recv",			required_argument,	NULL, PERF_ENABLE_ZCOPY_RECV},
+#define PERF_LATENCY_THRESHOLD	273
+	{"latency-threshold",			required_argument,	NULL, PERF_LATENCY_THRESHOLD},
 	/* Should be the last element */
 	{0, 0, 0, 0}
 };
@@ -2707,6 +2728,19 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 			break;
 		case PERF_ENABLE_SW_LATENCY_TRACING:
 			g_latency_sw_tracking_level++;
+			break;
+		case PERF_LATENCY_THRESHOLD:
+			if (optarg == NULL) {
+				fprintf(stderr, "Option --latency-threshold requires an argument\n");
+				usage(argv[0]);
+				return 1;
+			}
+			errno = 0;
+			g_latency_threshold_multiplier = strtod(optarg, &endptr);
+			if (errno || optarg == endptr || g_latency_threshold_multiplier <= 0.0) {
+				fprintf(stderr, "Illegal latency threshold multiplier %s (must be > 0.0)\n", optarg);
+				return 1;
+			}
 			break;
 		case PERF_NO_SHST_NOTIFICATION:
 			g_no_shn_notification = true;
