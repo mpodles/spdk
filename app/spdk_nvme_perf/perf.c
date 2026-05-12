@@ -134,6 +134,12 @@ struct ns_worker_ctx {
 	uint64_t		offset_in_ios;
 	bool			is_draining;
 
+	/* Burst experiment */
+	bool		       *qp_active;      /* [num_active_qpairs], set by picker; NULL = all active */
+	uint32_t		num_active_qps; /* atomic count of active QPs in qp_active[] */
+	uint64_t		tsc_next_io;    /* earliest TSC for next submit (rate limiting) */
+	TAILQ_HEAD(, perf_task)	idle_tasks;     /* tasks parked while inactive or rate-limited */
+
 	union {
 		struct {
 			int				num_active_qpairs;
@@ -177,6 +183,7 @@ struct perf_task {
 	struct iovec		md_iov;
 	uint64_t		submit_tsc;
 	bool			is_read;
+	int			qp_idx;   /* QP index used for this task; set by submit_single_io */
 	struct spdk_dif_ctx	dif_ctx;
 #if HAVE_LIBAIO
 	struct iocb		iocb;
@@ -276,6 +283,18 @@ static uint8_t g_transport_tos = 0;
 
 static uint32_t g_rdma_srq_size;
 static struct spdk_key *g_psk = NULL;
+
+/* Burst experiment parameters */
+static uint64_t g_total_iops        = 0;   /* max IOPS per active ns_ctx; 0 = unlimited */
+static uint32_t g_burst_pct         = 0;   /* 0 = burst mode disabled; 1-100 = % of QPs active */
+static uint64_t g_burst_interval_tsc = 0;  /* picker fires every this many TSC ticks */
+static uint64_t g_tsc_next_burst    = 0;
+static uint64_t g_picker_seed       = 0x123456789abcdef0ULL;
+
+struct qp_handle {
+	struct ns_worker_ctx	*ns_ctx;
+	int			 qp_idx;
+};
 
 /* When user specifies -Q, some error messages are rate limited.  When rate
  * limited, we only print the error message every g_quiet_count times the
@@ -960,10 +979,15 @@ nvme_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
 		}
 	}
 
-	qp_num = ns_ctx->u.nvme.last_qpair;
-	ns_ctx->u.nvme.last_qpair++;
-	if (ns_ctx->u.nvme.last_qpair == ns_ctx->u.nvme.num_active_qpairs) {
-		ns_ctx->u.nvme.last_qpair = 0;
+	if (g_burst_pct > 0) {
+		/* QP was already selected and recorded by submit_single_io */
+		qp_num = task->qp_idx;
+	} else {
+		qp_num = ns_ctx->u.nvme.last_qpair;
+		ns_ctx->u.nvme.last_qpair++;
+		if (ns_ctx->u.nvme.last_qpair == ns_ctx->u.nvme.num_active_qpairs) {
+			ns_ctx->u.nvme.last_qpair = 0;
+		}
 	}
 
 	if (mode != DIF_MODE_NONE) {
@@ -1190,13 +1214,18 @@ poll_group_failed:
 static void
 nvme_cleanup_ns_worker_ctx(struct ns_worker_ctx *ns_ctx)
 {
-	int i;
+	/*
+	 * Skip per-QP Delete SQ teardown entirely. Each free_io_qpair is a synchronous
+	 * round-trip on the shared admin QP, so N QPs = N sequential round-trips.
+	 * Instead, unregister_controllers() sends a single NVMe-oF Disconnect command
+	 * which tears down all QPs on the controller at once (O(1) round-trips total).
+	 */
+	fprintf(stderr, "[cleanup] lcore %u: skipping per-QP teardown for %d qpairs on ns %s"
+		" (controller detach handles bulk disconnect)\n",
+		spdk_env_get_current_core(),
+		ns_ctx->u.nvme.num_all_qpairs,
+		ns_ctx->entry->name);
 
-	for (i = 0; i < ns_ctx->u.nvme.num_all_qpairs; i++) {
-		spdk_nvme_ctrlr_free_io_qpair(ns_ctx->u.nvme.qpair[i]);
-	}
-
-	spdk_nvme_poll_group_destroy(ns_ctx->u.nvme.group);
 	free(ns_ctx->u.nvme.qpair);
 }
 
@@ -1540,6 +1569,32 @@ submit_single_io(struct perf_task *task)
 
 	assert(!ns_ctx->is_draining);
 
+	/* Burst mode: find next active QP via round-robin; park if none available */
+	if (g_burst_pct > 0) {
+		uint32_t num_active = __atomic_load_n(&ns_ctx->num_active_qps, __ATOMIC_ACQUIRE);
+		if (num_active == 0) {
+			TAILQ_INSERT_TAIL(&ns_ctx->idle_tasks, task, link);
+			return;
+		}
+		int nq = ns_ctx->u.nvme.num_active_qpairs;
+		int start = ns_ctx->u.nvme.last_qpair;
+		int chosen = -1, i;
+		for (i = 0; i < nq; i++) {
+			int candidate = (start + i) % nq;
+			if (__atomic_load_n(&ns_ctx->qp_active[candidate], __ATOMIC_ACQUIRE)) {
+				chosen = candidate;
+				ns_ctx->u.nvme.last_qpair = (candidate + 1) % nq;
+				break;
+			}
+		}
+		if (chosen < 0) {
+			/* num_active_qps was stale; park and retry next poll */
+			TAILQ_INSERT_TAIL(&ns_ctx->idle_tasks, task, link);
+			return;
+		}
+		task->qp_idx = chosen;
+	}
+
 	if (entry->zipf) {
 		offset_in_ios = spdk_zipf_generate(entry->zipf);
 	} else if (g_is_random) {
@@ -1650,7 +1705,24 @@ task_complete(struct perf_task *task)
 			spdk_dma_free(task->md_iov.iov_base);
 		}
 		free(task);
+	} else if (g_total_iops > 0 && spdk_get_ticks() < ns_ctx->tsc_next_io) {
+		/* Rate limit not yet reached — defer */
+		TAILQ_INSERT_TAIL(&ns_ctx->idle_tasks, task, link);
 	} else {
+		if (g_total_iops > 0) {
+			/*
+			 * Scale the inter-submission interval by the number of active QPs:
+			 * interval = tsc_rate / (total_iops * num_active_qps)
+			 * This makes total_iops a per-QP cap — each active QP independently
+			 * runs at total_iops IOPS, so the ns_worker_ctx total scales with
+			 * how many QPs are currently active.
+			 */
+			uint32_t n = __atomic_load_n(&ns_ctx->num_active_qps, __ATOMIC_RELAXED);
+			if (n == 0) {
+				n = 1;
+			}
+			ns_ctx->tsc_next_io = spdk_get_ticks() + g_tsc_rate / (g_total_iops * n);
+		}
 		submit_single_io(task);
 	}
 }
@@ -1721,20 +1793,69 @@ submit_io(struct ns_worker_ctx *ns_ctx, int queue_depth)
 static int
 init_ns_worker_ctx(struct ns_worker_ctx *ns_ctx)
 {
+	int rc, nq, i;
+
 	TAILQ_INIT(&ns_ctx->queued_tasks);
-	return ns_ctx->entry->fn_table->init_ns_worker_ctx(ns_ctx);
+	TAILQ_INIT(&ns_ctx->idle_tasks);
+	ns_ctx->tsc_next_io = 0;
+
+	rc = ns_ctx->entry->fn_table->init_ns_worker_ctx(ns_ctx);
+	if (rc != 0) {
+		return rc;
+	}
+
+	/* Allocate per-QP active flags; num_active_qpairs is set by fn_table init above */
+	nq = ns_ctx->u.nvme.num_active_qpairs;
+	if (nq < 1) {
+		nq = 1;
+	}
+	ns_ctx->qp_active = calloc(nq, sizeof(bool));
+	if (!ns_ctx->qp_active) {
+		return -ENOMEM;
+	}
+	for (i = 0; i < nq; i++) {
+		ns_ctx->qp_active[i] = true;
+	}
+	__atomic_store_n(&ns_ctx->num_active_qps, (uint32_t)nq, __ATOMIC_RELAXED);
+
+	return 0;
 }
 
 static void
 cleanup_ns_worker_ctx(struct ns_worker_ctx *ns_ctx)
 {
 	struct perf_task *task, *ttask;
+	uint64_t idle_count = 0, queued_count = 0;
+
+	TAILQ_FOREACH(task, &ns_ctx->idle_tasks, link) { idle_count++; }
+	TAILQ_FOREACH(task, &ns_ctx->queued_tasks, link) { queued_count++; }
+
+	fprintf(stderr, "[cleanup] lcore %u: ns %s qd=%" PRIu64 " idle=%" PRIu64 " queued=%" PRIu64 "\n",
+		spdk_env_get_current_core(), ns_ctx->entry->name,
+		ns_ctx->current_queue_depth, idle_count, queued_count);
+
+	/* Free any tasks parked in idle_tasks (never resubmitted while burst-inactive) */
+	TAILQ_FOREACH_SAFE(task, &ns_ctx->idle_tasks, link, ttask) {
+		TAILQ_REMOVE(&ns_ctx->idle_tasks, task, link);
+		if (!g_zcopy) {
+			spdk_dma_free(task->iovs[0].iov_base);
+			free(task->iovs);
+			spdk_dma_free(task->md_iov.iov_base);
+		}
+		free(task);
+	}
 
 	TAILQ_FOREACH_SAFE(task, &ns_ctx->queued_tasks, link, ttask) {
 		TAILQ_REMOVE(&ns_ctx->queued_tasks, task, link);
 		task_complete(task);
 	}
+	free(ns_ctx->qp_active);
+	ns_ctx->qp_active = NULL;
+	fprintf(stderr, "[cleanup] lcore %u: calling fn_table cleanup for ns %s\n",
+		spdk_env_get_current_core(), ns_ctx->entry->name);
 	ns_ctx->entry->fn_table->cleanup_ns_worker_ctx(ns_ctx);
+	fprintf(stderr, "[cleanup] lcore %u: fn_table cleanup done for ns %s\n",
+		spdk_env_get_current_core(), ns_ctx->entry->name);
 }
 
 static void
@@ -1799,6 +1920,92 @@ perf_dump_transport_statistics(struct worker_thread *worker)
 	}
 }
 
+/*
+ * Burst picker: randomly activates g_burst_pct% of all individual QPs.
+ * Runs on the main core only, at g_burst_interval_tsc intervals.
+ * Builds a flat array of (ns_worker_ctx*, qp_idx) pairs on first call
+ * (safe: g_workers is read-only during the run phase).
+ */
+static void
+burst_picker_tick(void)
+{
+	static struct qp_handle *all_qps = NULL;
+	static uint32_t num_qps = 0;
+
+	struct worker_thread *worker;
+	struct ns_worker_ctx *ns_ctx;
+	uint32_t i, j, n_active;
+	int nq, q;
+
+	if (spdk_unlikely(all_qps == NULL)) {
+		TAILQ_FOREACH(worker, &g_workers, link) {
+			TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
+				nq = ns_ctx->u.nvme.num_active_qpairs;
+				num_qps += (nq > 0) ? (uint32_t)nq : 1;
+			}
+		}
+		all_qps = calloc(num_qps, sizeof(*all_qps));
+		if (!all_qps) {
+			return;
+		}
+		i = 0;
+		TAILQ_FOREACH(worker, &g_workers, link) {
+			TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
+				nq = ns_ctx->u.nvme.num_active_qpairs;
+				if (nq < 1) {
+					nq = 1;
+				}
+				for (q = 0; q < nq; q++) {
+					all_qps[i].ns_ctx = ns_ctx;
+					all_qps[i].qp_idx = q;
+					i++;
+				}
+			}
+		}
+	}
+
+	n_active = (num_qps * g_burst_pct + 99) / 100;
+	if (n_active > num_qps) {
+		n_active = num_qps;
+	}
+
+	/* Partial Fisher-Yates: randomly select n_active QPs into the first slots */
+	for (i = 0; i < n_active; i++) {
+		j = i + (uint32_t)(spdk_rand_xorshift64(&g_picker_seed) % (num_qps - i));
+		struct qp_handle tmp = all_qps[i];
+		all_qps[i] = all_qps[j];
+		all_qps[j] = tmp;
+	}
+
+	/* Deactivate all QPs, then activate the selected ones */
+	for (i = 0; i < num_qps; i++) {
+		__atomic_store_n(&all_qps[i].ns_ctx->qp_active[all_qps[i].qp_idx],
+				 false, __ATOMIC_RELAXED);
+	}
+	for (i = 0; i < n_active; i++) {
+		__atomic_store_n(&all_qps[i].ns_ctx->qp_active[all_qps[i].qp_idx],
+				 true, __ATOMIC_RELAXED);
+	}
+
+	/* Recompute num_active_qps per ns_ctx */
+	TAILQ_FOREACH(worker, &g_workers, link) {
+		TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
+			uint32_t count = 0;
+			nq = ns_ctx->u.nvme.num_active_qpairs;
+			if (nq < 1) {
+				nq = 1;
+			}
+			for (q = 0; q < nq; q++) {
+				if (__atomic_load_n(&ns_ctx->qp_active[q], __ATOMIC_RELAXED)) {
+					count++;
+				}
+			}
+			__atomic_store_n(&ns_ctx->num_active_qps, count, __ATOMIC_RELEASE);
+		}
+	}
+
+}
+
 static int
 work_fn(void *arg)
 {
@@ -1842,6 +2049,13 @@ work_fn(void *arg)
 		tsc_end = tsc_current + g_time_in_sec * g_tsc_rate;
 	}
 
+	/* Fire the burst picker once immediately so the initial QP selection is
+	 * random from the very first I/O, not after the first burst_interval. */
+	if (worker->lcore == g_main_core && g_burst_pct > 0) {
+		burst_picker_tick();
+		g_tsc_next_burst = tsc_current + g_burst_interval_tsc;
+	}
+
 	/* Submit initial I/O for each namespace. */
 	TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
 		submit_io(ns_ctx, g_queue_depth);
@@ -1872,6 +2086,32 @@ work_fn(void *arg)
 				}
 			}
 
+		/* Drain idle_tasks when QPs are available and there is room */
+			if (!TAILQ_EMPTY(&ns_ctx->idle_tasks) && !ns_ctx->is_draining) {
+			bool active = (g_burst_pct == 0) ||
+				      (__atomic_load_n(&ns_ctx->num_active_qps,
+						       __ATOMIC_ACQUIRE) > 0);
+			if (active) {
+					uint64_t now = spdk_get_ticks();
+					while (!TAILQ_EMPTY(&ns_ctx->idle_tasks) &&
+					       ns_ctx->current_queue_depth < g_queue_depth) {
+					if (g_total_iops > 0 && now < ns_ctx->tsc_next_io) {
+						break;
+					}
+					task = TAILQ_FIRST(&ns_ctx->idle_tasks);
+					TAILQ_REMOVE(&ns_ctx->idle_tasks, task, link);
+					if (g_total_iops > 0) {
+						uint32_t _n = __atomic_load_n(&ns_ctx->num_active_qps, __ATOMIC_RELAXED);
+						if (_n == 0) {
+							_n = 1;
+						}
+						ns_ctx->tsc_next_io = now + g_tsc_rate / (g_total_iops * _n);
+					}
+						submit_single_io(task);
+					}
+				}
+			}
+
 			check_now = spdk_get_ticks();
 			check_rc = ns_ctx->entry->fn_table->check_io(ns_ctx);
 
@@ -1896,6 +2136,11 @@ work_fn(void *arg)
 		if (worker->lcore == g_main_core && tsc_current > tsc_next_print) {
 			tsc_next_print += g_tsc_rate;
 			print_periodic_performance(warmup);
+			if (g_burst_pct > 0 && g_burst_interval_tsc > 0 &&
+			    tsc_current >= g_tsc_next_burst) {
+				burst_picker_tick();
+				g_tsc_next_burst = tsc_current + g_burst_interval_tsc;
+			}
 		}
 
 		if (tsc_current > tsc_end) {
@@ -1931,22 +2176,55 @@ work_fn(void *arg)
 	}
 
 	/* drain the io of each ns_ctx in round robin to make the fairness */
-	do {
-		unfinished_ns_ctx = 0;
-		TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
-			/* first time will enter into this if case */
-			if (!ns_ctx->is_draining) {
-				ns_ctx->is_draining = true;
-			}
+	fprintf(stderr, "[drain] lcore %u: starting drain phase\n", worker->lcore);
+	{
+		uint64_t drain_start_tsc = spdk_get_ticks();
+		uint64_t drain_timeout_tsc = drain_start_tsc + 10ULL * g_tsc_rate; /* 10 s timeout */
+		uint64_t last_log_tsc = drain_start_tsc;
 
-			if (ns_ctx->current_queue_depth > 0) {
-				ns_ctx->entry->fn_table->check_io(ns_ctx);
+		do {
+			unfinished_ns_ctx = 0;
+			TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
+				/* first time will enter into this if case */
+				if (!ns_ctx->is_draining) {
+					ns_ctx->is_draining = true;
+				}
+
 				if (ns_ctx->current_queue_depth > 0) {
-					unfinished_ns_ctx++;
+					ns_ctx->entry->fn_table->check_io(ns_ctx);
+					if (ns_ctx->current_queue_depth > 0) {
+						unfinished_ns_ctx++;
+					}
 				}
 			}
-		}
-	} while (unfinished_ns_ctx > 0);
+
+			uint64_t now_tsc = spdk_get_ticks();
+
+			/* Log progress every second */
+			if (now_tsc - last_log_tsc > g_tsc_rate) {
+				TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
+					if (ns_ctx->current_queue_depth > 0) {
+						uint64_t idle_cnt = 0;
+						struct perf_task *_t;
+						TAILQ_FOREACH(_t, &ns_ctx->idle_tasks, link) { idle_cnt++; }
+						fprintf(stderr,
+							"[drain] lcore %u: ns %s still has qd=%" PRIu64 " idle=%" PRIu64 "\n",
+							worker->lcore, ns_ctx->entry->name,
+							ns_ctx->current_queue_depth, idle_cnt);
+					}
+				}
+				last_log_tsc = now_tsc;
+			}
+
+			if (now_tsc > drain_timeout_tsc) {
+				fprintf(stderr, "[drain] lcore %u: TIMEOUT waiting for drain, forcing exit "
+					"(%u ns_ctxs still unfinished)\n", worker->lcore, unfinished_ns_ctx);
+				break;
+			}
+		} while (unfinished_ns_ctx > 0 && !g_exit);
+	}
+	fprintf(stderr, "[drain] lcore %u: drain phase complete%s\n",
+		worker->lcore, g_exit ? " (interrupted)" : "");
 
 	if (g_dump_transport_stats) {
 		pthread_mutex_lock(&g_stats_mutex);
@@ -1954,9 +2232,11 @@ work_fn(void *arg)
 		pthread_mutex_unlock(&g_stats_mutex);
 	}
 
+	fprintf(stderr, "[cleanup] lcore %u: starting ns_ctx cleanup\n", worker->lcore);
 	TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
 		cleanup_ns_worker_ctx(ns_ctx);
 	}
+	fprintf(stderr, "[cleanup] lcore %u: all ns_ctx cleanup done\n", worker->lcore);
 
 	return 0;
 }
@@ -2051,6 +2331,12 @@ usage(char *program_name)
 	printf("\t\t-L for latency summary, -LL for detailed histogram\n");
 	printf("\t-l, --enable-ssd-latency-tracking enable latency tracking via ssd (if supported), default: disabled\n");
 	printf("\t--latency-threshold <multiplier> log requests when latency exceeds multiplier times average (e.g., 3.0 for 3x avg), default: disabled\n");
+	printf("\n==== BURST EXPERIMENT OPTIONS ====\n\n");
+	printf("\t--total-iops <val>      max IOPS per active ns_ctx/QP group (0 = unlimited, default: 0)\n");
+	printf("\t                         each active context is independently rate-limited to this value\n");
+	printf("\t                         total system IOPS = total-iops * num_active_ctxs\n");
+	printf("\t--burst-pct <1-100>      percentage of ns_worker_ctxs active at any time (0 = disabled, default: 0)\n");
+	printf("\t--burst-interval <sec>   seconds between burst picker firings (default: 1)\n");
 	printf("\t-N, --no-shst-notification no shutdown notification process for controllers, default: disabled\n");
 	printf("\t-Q, --continue-on-error <val> Do not stop on error. Log I/O errors every N times (default: 1)\n");
 	spdk_log_usage(stdout, "\t-T");
@@ -2538,6 +2824,12 @@ static const struct option g_perf_cmdline_opts[] = {
 	{"enable-zcopy-recv",			required_argument,	NULL, PERF_ENABLE_ZCOPY_RECV},
 #define PERF_LATENCY_THRESHOLD	273
 	{"latency-threshold",			required_argument,	NULL, PERF_LATENCY_THRESHOLD},
+#define PERF_TOTAL_IOPS	274
+	{"total-iops",				required_argument,	NULL, PERF_TOTAL_IOPS},
+#define PERF_BURST_PCT		275
+	{"burst-pct",				required_argument,	NULL, PERF_BURST_PCT},
+#define PERF_BURST_INTERVAL	276
+	{"burst-interval",			required_argument,	NULL, PERF_BURST_INTERVAL},
 	/* Should be the last element */
 	{0, 0, 0, 0}
 };
@@ -2741,6 +3033,30 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 				fprintf(stderr, "Illegal latency threshold multiplier %s (must be > 0.0)\n", optarg);
 				return 1;
 			}
+			break;
+		case PERF_TOTAL_IOPS:
+			g_total_iops = strtoull(optarg, &endptr, 10);
+			if (*endptr != '\0' || g_total_iops == 0) {
+				fprintf(stderr, "--total-iops must be a positive integer\n");
+				return 1;
+			}
+			break;
+		case PERF_BURST_PCT:
+			val = spdk_strtol(optarg, 10);
+			if (val < 1 || val > 100) {
+				fprintf(stderr, "--burst-pct must be 1-100\n");
+				return 1;
+			}
+			g_burst_pct = (uint32_t)val;
+			break;
+		case PERF_BURST_INTERVAL:
+			val = spdk_strtol(optarg, 10);
+			if (val < 1) {
+				fprintf(stderr, "--burst-interval must be >= 1 second\n");
+				return 1;
+			}
+			/* Converted to TSC ticks after g_tsc_rate is set in spdk_main() */
+			g_burst_interval_tsc = (uint64_t)val;
 			break;
 		case PERF_NO_SHST_NOTIFICATION:
 			g_no_shn_notification = true;
@@ -3103,6 +3419,7 @@ unregister_controllers(void)
 {
 	struct ctrlr_entry *entry, *tmp;
 	struct spdk_nvme_detach_ctx *detach_ctx = NULL;
+	int n = 0;
 
 	TAILQ_FOREACH_SAFE(entry, &g_controllers, link, tmp) {
 		TAILQ_REMOVE(&g_controllers, entry, link);
@@ -3123,12 +3440,19 @@ unregister_controllers(void)
 			free(entry->unused_qpairs);
 		}
 
+		fprintf(stderr, "[exit] detach_async for controller %d...\n", n++);
 		spdk_nvme_detach_async(entry->ctrlr, &detach_ctx);
 		free(entry);
 	}
 
 	if (detach_ctx) {
-		spdk_nvme_detach_poll(detach_ctx);
+		if (g_exit) {
+			fprintf(stderr, "[exit] fast-exit: skipping detach_poll, letting OS clean up\n");
+		} else {
+			fprintf(stderr, "[exit] detach_poll for %d controllers...\n", n);
+			spdk_nvme_detach_poll(detach_ctx);
+			fprintf(stderr, "[exit] detach_poll done\n");
+		}
 	}
 
 	if (g_vmd) {
@@ -3321,6 +3645,11 @@ main(int argc, char **argv)
 	}
 
 	g_tsc_rate = spdk_get_ticks_hz();
+	if (g_burst_interval_tsc > 0) {
+		/* g_burst_interval_tsc was stored as seconds in parse_args; convert now */
+		g_burst_interval_tsc *= g_tsc_rate;
+	}
+	g_tsc_next_burst = spdk_get_ticks() + g_burst_interval_tsc;
 
 	if (register_workers() != 0) {
 		rc = -1;
@@ -3387,7 +3716,9 @@ main(int argc, char **argv)
 	assert(main_worker != NULL);
 	work_fn(main_worker);
 
+	fprintf(stderr, "[exit] waiting for all worker threads to finish...\n");
 	spdk_env_thread_wait_all();
+	fprintf(stderr, "[exit] all worker threads done\n");
 
 	print_stats();
 
@@ -3414,13 +3745,14 @@ cleanup:
 		}
 	}
 
-	unregister_namespaces();
-	unregister_controllers();
-	unregister_workers();
-
-	free_key(&g_psk);
-	spdk_keyring_cleanup();
-	spdk_env_fini();
+	/*
+	 * Skip all SPDK/DPDK teardown: spdk_nvme_detach_async internally tries to
+	 * clean up I/O QPs that we already abandoned, causing it to block. Since this
+	 * is an experiment tool, let the OS reclaim all RDMA and memory resources.
+	 * The target will detect the connection loss and clean up its own state.
+	 */
+	fprintf(stderr, "[exit] bypassing SPDK teardown — calling exit() directly\n");
+	exit(rc);
 
 	pthread_mutex_destroy(&g_stats_mutex);
 
