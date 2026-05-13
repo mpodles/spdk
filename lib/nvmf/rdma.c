@@ -398,6 +398,13 @@ struct spdk_nvmf_rdma_qpair {
 
 	/* Indicate that nvmf_rdma_close_qpair is called */
 	bool					to_close;
+
+	/* XRC: alongside RC path — built for logging/validation, not used for I/O */
+	struct ibv_qp				*xrc_ini_qp;  /* IBV_QPT_XRC_SEND */
+	struct ibv_qp				*xrc_tgt_qp;  /* IBV_QPT_XRC_RECV */
+	uint32_t				remote_xrc_ini_qpn; /* initiator's XRC_SEND QPN */
+	uint32_t				remote_xrc_tgt_qpn; /* initiator's XRC_RECV QPN */
+	uint32_t				remote_xrc_srqn;    /* initiator's per-qpair SRQ number */
 };
 
 struct spdk_nvmf_rdma_poller_stat {
@@ -427,6 +434,11 @@ struct spdk_nvmf_rdma_poller {
 
 	/* Shared receive queue */
 	struct spdk_rdma_provider_srq		*srq;
+
+	/* XRC: one XRC SRQ per poller; all qpairs on this poller post commands here */
+	struct ibv_cq				*xrc_cq;    /* plain ibv_cq for XRC objects */
+	struct ibv_srq				*xrc_srq;
+	uint32_t				xrc_srqn;
 
 	struct spdk_nvmf_rdma_resources		*resources;
 	struct spdk_nvmf_rdma_poller_stat	stat;
@@ -476,6 +488,10 @@ struct spdk_nvmf_rdma_device {
 	bool					ready_to_destroy;
 	bool					is_ready;
 
+	/* XRC: one XRCD per device, shared by all pollers and qpairs on this device */
+	struct ibv_xrcd				*xrcd;
+	int					xrcd_fd;
+
 	TAILQ_ENTRY(spdk_nvmf_rdma_device)	link;
 };
 
@@ -493,6 +509,7 @@ struct rdma_transport_opts {
 	bool		no_wr_batching;
 	bool		in_capsule_data_disabled;
 	int		acceptor_backlog;
+	bool		xrc; /* enable XRC alongside RC for development/logging */
 };
 
 struct spdk_nvmf_rdma_transport {
@@ -549,6 +566,10 @@ static const struct spdk_json_object_decoder rdma_transport_opts_decoder[] = {
 	{
 		"acceptor_backlog", offsetof(struct rdma_transport_opts, acceptor_backlog),
 		spdk_json_decode_int32, true
+	},
+	{
+		"xrc", offsetof(struct rdma_transport_opts, xrc),
+		spdk_json_decode_bool, true
 	},
 };
 
@@ -869,6 +890,13 @@ nvmf_rdma_qpair_clean_ibv_events(struct spdk_nvmf_rdma_qpair *rqpair)
 
 static void nvmf_rdma_poller_destroy(struct spdk_nvmf_rdma_poller *poller);
 
+/* Forward declaration — defined near nvmf_rdma_poller_create */
+static int nvmf_xrc_bring_qps_to_rts(struct rdma_cm_id *cm_id,
+				      struct ibv_qp *ini_qp,
+				      struct ibv_qp *tgt_qp,
+				      uint32_t remote_tgt_qpn,
+				      uint32_t remote_ini_qpn);
+
 static void
 nvmf_rdma_qpair_destroy(struct spdk_nvmf_rdma_qpair *rqpair)
 {
@@ -948,6 +976,20 @@ nvmf_rdma_qpair_destroy(struct spdk_nvmf_rdma_qpair *rqpair)
 
 	if (rqpair->poller && rqpair->poller->need_destroy && RB_EMPTY(&rqpair->poller->qpairs)) {
 		nvmf_rdma_poller_destroy(rqpair->poller);
+	}
+
+	/* XRC: destroy alongside QPs before cm_id */
+	if (rqpair->xrc_ini_qp) {
+		SPDK_NOTICELOG("XRC: destroying INI QP qpn=%u for qpair %p\n",
+			       rqpair->xrc_ini_qp->qp_num, rqpair);
+		ibv_destroy_qp(rqpair->xrc_ini_qp);
+		rqpair->xrc_ini_qp = NULL;
+	}
+	if (rqpair->xrc_tgt_qp) {
+		SPDK_NOTICELOG("XRC: destroying TGT QP qpn=%u for qpair %p\n",
+			       rqpair->xrc_tgt_qp->qp_num, rqpair);
+		ibv_destroy_qp(rqpair->xrc_tgt_qp);
+		rqpair->xrc_tgt_qp = NULL;
 	}
 
 	/* destroy cm_id last so cma device will not be freed before we destroy the cq. */
@@ -1041,6 +1083,83 @@ nvmf_rdma_qpair_initialize(struct spdk_nvmf_qpair *qpair)
 	}
 
 	rqpair->qp_num = rqpair->rdma_qp->qp->qp_num;
+
+	/* XRC: create INI + TGT QP pair alongside the existing RC QP, for logging/validation */
+	{
+		struct spdk_nvmf_rdma_transport *rtransport_xrc =
+			SPDK_CONTAINEROF(rqpair->qpair.transport,
+					 struct spdk_nvmf_rdma_transport, transport);
+		if (rtransport_xrc->rdma_opts.xrc && device->xrcd && rqpair->poller->xrc_srq) {
+			struct ibv_qp_init_attr_ex ini_attr = {};
+			struct ibv_qp_init_attr_ex tgt_attr = {};
+			struct ibv_cq *cq = rqpair->poller->xrc_cq;
+
+			/* INI QP (XRC_SEND): sends completions to initiator's XRC SRQ */
+			ini_attr.comp_mask  = IBV_QP_INIT_ATTR_PD | IBV_QP_INIT_ATTR_XRCD;
+			ini_attr.qp_type    = IBV_QPT_XRC_SEND;
+			ini_attr.xrcd       = device->xrcd;
+			ini_attr.pd         = device->pd;
+			ini_attr.send_cq    = cq;
+			ini_attr.recv_cq    = cq;
+			ini_attr.cap.max_send_wr  = rqpair->max_queue_depth;
+			ini_attr.cap.max_send_sge = 1;
+			ini_attr.cap.max_recv_wr  = 0;
+
+			rqpair->xrc_ini_qp = ibv_create_qp_ex(device->context, &ini_attr);
+			if (!rqpair->xrc_ini_qp) {
+				SPDK_ERRLOG("XRC: ibv_create_qp_ex(XRC_SEND) failed errno=%d\n", errno);
+				goto xrc_qp_done;
+			}
+			SPDK_NOTICELOG("XRC target qpair %p: INI QP created qpn=%u (XRC_SEND) cq=%p\n",
+				       rqpair, rqpair->xrc_ini_qp->qp_num, cq);
+
+			/* TGT QP (XRC_RECV): receives commands from initiator; delivers to xrc_srq */
+			tgt_attr.comp_mask  = IBV_QP_INIT_ATTR_PD | IBV_QP_INIT_ATTR_XRCD;
+			tgt_attr.qp_type    = IBV_QPT_XRC_RECV;
+			tgt_attr.xrcd       = device->xrcd;
+			tgt_attr.pd         = device->pd;
+			tgt_attr.send_cq    = cq;
+			tgt_attr.recv_cq    = cq;
+			tgt_attr.cap.max_send_wr  = 1;
+			tgt_attr.cap.max_recv_wr  = 0;
+
+			rqpair->xrc_tgt_qp = ibv_create_qp_ex(device->context, &tgt_attr);
+			if (!rqpair->xrc_tgt_qp) {
+				SPDK_ERRLOG("XRC: ibv_create_qp_ex(XRC_RECV) failed errno=%d\n", errno);
+				ibv_destroy_qp(rqpair->xrc_ini_qp);
+				rqpair->xrc_ini_qp = NULL;
+				goto xrc_qp_done;
+			}
+			SPDK_NOTICELOG("XRC target qpair %p: TGT QP created qpn=%u (XRC_RECV) srq=%p srqn=%u\n",
+				       rqpair, rqpair->xrc_tgt_qp->qp_num,
+				       rqpair->poller->xrc_srq, rqpair->poller->xrc_srqn);
+			SPDK_NOTICELOG("XRC target qpair %p: remote ini_qpn=%u tgt_qpn=%u srqn=%u\n",
+				       rqpair, rqpair->remote_xrc_ini_qpn,
+				       rqpair->remote_xrc_tgt_qpn, rqpair->remote_xrc_srqn);
+
+			/* Bring XRC QPs to RTS if remote QPNs were provided */
+			if (rqpair->remote_xrc_ini_qpn != 0 && rqpair->remote_xrc_tgt_qpn != 0) {
+				int xrc_rc = nvmf_xrc_bring_qps_to_rts(
+						rqpair->cm_id,
+						rqpair->xrc_ini_qp,
+						rqpair->xrc_tgt_qp,
+						rqpair->remote_xrc_tgt_qpn,
+						rqpair->remote_xrc_ini_qpn);
+				if (xrc_rc != 0) {
+					SPDK_ERRLOG("XRC: qpair %p QP bring-up failed rc=%d\n",
+						    rqpair, xrc_rc);
+				} else {
+					SPDK_NOTICELOG("XRC: qpair %p both QPs RTS — ini_qpn=%u tgt_qpn=%u\n",
+						       rqpair, rqpair->xrc_ini_qp->qp_num,
+						       rqpair->xrc_tgt_qp->qp_num);
+				}
+			} else {
+				SPDK_NOTICELOG("XRC: qpair %p remote QPNs=0 (non-XRC initiator), "
+					       "skipping XRC QP bring-up\n", rqpair);
+			}
+xrc_qp_done:;
+		}
+	}
 
 	rqpair->max_send_depth = spdk_min((uint32_t)(rqpair->max_queue_depth * 2),
 					  qp_init_attr.cap.max_send_wr);
@@ -1284,6 +1403,15 @@ nvmf_rdma_event_accept(struct rdma_cm_id *id, struct spdk_nvmf_rdma_qpair *rqpai
 	accept_data.recfmt = 0;
 	accept_data.crqsize = rqpair->max_queue_depth;
 
+	if (rqpair->xrc_ini_qp && rqpair->xrc_tgt_qp && rqpair->poller->xrc_srqn) {
+		accept_data.xrc_ini_qpn = rqpair->xrc_ini_qp->qp_num;
+		accept_data.xrc_tgt_qpn = rqpair->xrc_tgt_qp->qp_num;
+		accept_data.xrc_srqn    = rqpair->poller->xrc_srqn;
+		SPDK_NOTICELOG("XRC accept: qpair %p sending ini_qpn=%u tgt_qpn=%u srqn=%u\n",
+			       rqpair, accept_data.xrc_ini_qpn,
+			       accept_data.xrc_tgt_qpn, accept_data.xrc_srqn);
+	}
+
 	ctrlr_event_data.private_data = &accept_data;
 	ctrlr_event_data.private_data_len = sizeof(accept_data);
 	if (id->ps == RDMA_PS_TCP) {
@@ -1341,6 +1469,40 @@ nvmf_rdma_connect(struct spdk_nvmf_transport *transport, struct rdma_cm_event *e
 
 	assert(event->id != NULL); /* Impossible. Can't even reject the connection. */
 	assert(event->id->verbs != NULL); /* Impossible. No way to handle this. */
+
+	{
+		struct sockaddr *peer = rdma_get_peer_addr(event->id);
+		struct sockaddr *local = rdma_get_local_addr(event->id);
+		char peer_buf[INET6_ADDRSTRLEN] = "<unknown>";
+		char local_buf[INET6_ADDRSTRLEN] = "<unknown>";
+		if (peer && peer->sa_family == AF_INET) {
+			inet_ntop(AF_INET, &((struct sockaddr_in *)peer)->sin_addr,
+				  peer_buf, sizeof(peer_buf));
+		} else if (peer && peer->sa_family == AF_INET6) {
+			inet_ntop(AF_INET6, &((struct sockaddr_in6 *)peer)->sin6_addr,
+				  peer_buf, sizeof(peer_buf));
+		}
+		if (local && local->sa_family == AF_INET) {
+			inet_ntop(AF_INET, &((struct sockaddr_in *)local)->sin_addr,
+				  local_buf, sizeof(local_buf));
+		} else if (local && local->sa_family == AF_INET6) {
+			inet_ntop(AF_INET6, &((struct sockaddr_in6 *)local)->sin6_addr,
+				  local_buf, sizeof(local_buf));
+		}
+		SPDK_NOTICELOG("CM CONNECT_REQUEST: peer=%s local=%s dev=%s\n",
+			       peer_buf, local_buf, event->id->verbs->device->name);
+		/* Log the path GIDs to catch BITW GID-mismatch issues. */
+		if (event->id->route.path_rec) {
+			char sgid[INET6_ADDRSTRLEN], dgid[INET6_ADDRSTRLEN];
+			inet_ntop(AF_INET6,
+				  event->id->route.path_rec->sgid.raw,
+				  sgid, sizeof(sgid));
+			inet_ntop(AF_INET6,
+				  event->id->route.path_rec->dgid.raw,
+				  dgid, sizeof(dgid));
+			SPDK_NOTICELOG("  CM path: SGID=%s DGID=%s\n", sgid, dgid);
+		}
+	}
 
 	rdma_param = &event->param.conn;
 	if (rdma_param->private_data == NULL ||
@@ -1437,6 +1599,15 @@ nvmf_rdma_connect(struct spdk_nvmf_transport *transport, struct rdma_cm_event *e
 	/* use qid from the private data to determine the qpair type
 	   qid will be set to the appropriate value when the controller is created */
 	rqpair->qpair.qid = private_data->qid;
+
+	if (rtransport->rdma_opts.xrc) {
+		rqpair->remote_xrc_ini_qpn = private_data->xrc_ini_qpn;
+		rqpair->remote_xrc_tgt_qpn = private_data->xrc_tgt_qpn;
+		rqpair->remote_xrc_srqn    = private_data->xrc_srqn;
+		SPDK_NOTICELOG("XRC connect: qpair %p remote_ini_qpn=%u remote_tgt_qpn=%u remote_srqn=%u\n",
+			       rqpair, rqpair->remote_xrc_ini_qpn,
+			       rqpair->remote_xrc_tgt_qpn, rqpair->remote_xrc_srqn);
+	}
 	rqpair->qpair.numa.id_valid = 1;
 	rqpair->qpair.numa.id = spdk_rdma_cm_id_get_numa_id(rqpair->cm_id);
 	rqpair->start_accel_sequence = spdk_rdma_provider_accel_sequence_supported() &&
@@ -2896,6 +3067,7 @@ create_ib_device(struct spdk_nvmf_rdma_transport *rtransport, struct ibv_context
 		return -ENOMEM;
 	}
 	device->context = context;
+	device->xrcd_fd = -1; /* not yet opened */
 	rc = ibv_query_device(device->context, &device->attr);
 	if (rc < 0) {
 		SPDK_ERRLOG("Failed to query RDMA device attributes.\n");
@@ -3219,6 +3391,20 @@ destroy_ib_device(struct spdk_nvmf_rdma_transport *rtransport,
 			spdk_rdma_utils_put_pd(device->pd);
 		}
 	}
+
+	/* XRC: close XRCD and backing fd */
+	if (device->xrcd) {
+		SPDK_NOTICELOG("XRC: closing XRCD %p on device %s\n",
+			       device->xrcd,
+			       ibv_get_device_name(device->context->device));
+		ibv_close_xrcd(device->xrcd);
+		device->xrcd = NULL;
+	}
+	if (device->xrcd_fd >= 0) {
+		close(device->xrcd_fd);
+		device->xrcd_fd = -1;
+	}
+
 	SPDK_DEBUGLOG(rdma, "IB device [%p] is destroyed.\n", device);
 	free(device);
 }
@@ -3905,7 +4091,6 @@ nvmf_rdma_disconnect(struct rdma_cm_event *evt, bool *event_acked)
 	return 0;
 }
 
-#ifdef DEBUG
 static const char *CM_EVENT_STR[] = {
 	"RDMA_CM_EVENT_ADDR_RESOLVED",
 	"RDMA_CM_EVENT_ADDR_ERROR",
@@ -3924,7 +4109,6 @@ static const char *CM_EVENT_STR[] = {
 	"RDMA_CM_EVENT_ADDR_CHANGE",
 	"RDMA_CM_EVENT_TIMEWAIT_EXIT"
 };
-#endif /* DEBUG */
 
 static void
 nvmf_rdma_disconnect_qpairs_on_port(struct spdk_nvmf_rdma_transport *rtransport,
@@ -4060,7 +4244,9 @@ nvmf_process_cm_events(struct spdk_nvmf_transport *transport, uint32_t max_event
 			break;
 		}
 
-		SPDK_DEBUGLOG(rdma, "Acceptor Event: %s\n", CM_EVENT_STR[event->event]);
+		SPDK_NOTICELOG("Acceptor CM event: %s (id=%p)\n",
+			       event->event < SPDK_COUNTOF(CM_EVENT_STR) ? CM_EVENT_STR[event->event] : "UNKNOWN",
+			       (void *)event->id);
 
 		spdk_trace_record(TRACE_RDMA_CM_ASYNC_EVENT, 0, 0, 0, event->event);
 
@@ -4396,6 +4582,132 @@ nvmf_rdma_discover(struct spdk_nvmf_transport *transport,
 	entry->tsas.rdma.rdma_cms = SPDK_NVMF_RDMA_CMS_RDMA_CM;
 }
 
+/*
+ * Bring an XRC QP pair (INI=XRC_SEND, TGT=XRC_RECV) through INIT→RTR→RTS.
+ *
+ * rdma_init_qp_attr() is used ONLY for path info (ah_attr, path_mtu, pkey_index).
+ * dest_qp_num is always overridden from the private-data-exchanged QPNs because
+ * conn_param.qp_num carries the RC QPN to keep the existing RC path working.
+ * attr_mask is set manually: XRC_RECV at RTS uses only STATE|SQ_PSN (no retry/timeout).
+ */
+static int
+nvmf_xrc_bring_qps_to_rts(struct rdma_cm_id *cm_id,
+			   struct ibv_qp *ini_qp,     /* IBV_QPT_XRC_SEND */
+			   struct ibv_qp *tgt_qp,     /* IBV_QPT_XRC_RECV */
+			   uint32_t remote_tgt_qpn,   /* dest for INI QP RTR */
+			   uint32_t remote_ini_qpn)   /* dest for TGT QP RTR */
+{
+	struct ibv_qp_attr attr = {};
+	int attr_mask, rc;
+
+	/* ---- INI QP (XRC_SEND): INIT → RTR → RTS, same masks as RC ---- */
+	memset(&attr, 0, sizeof(attr));
+	attr.qp_state = IBV_QPS_INIT;
+	rc = rdma_init_qp_attr(cm_id, &attr, &attr_mask);
+	if (rc) {
+		SPDK_ERRLOG("XRC INI INIT: rdma_init_qp_attr failed rc=%d errno=%d\n", rc, errno);
+		return rc;
+	}
+	SPDK_NOTICELOG("XRC INI INIT: qpn=%u pkey_idx=%u port=%u mask=0x%x\n",
+		       ini_qp->qp_num, attr.pkey_index, attr.port_num, attr_mask);
+	rc = ibv_modify_qp(ini_qp, &attr,
+			   IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_SQ_PSN);
+	if (rc) {
+		SPDK_ERRLOG("XRC INI INIT: ibv_modify_qp failed rc=%d errno=%d\n", rc, errno);
+		return rc;
+	}
+
+	memset(&attr, 0, sizeof(attr));
+	attr.qp_state = IBV_QPS_RTR;
+	rc = rdma_init_qp_attr(cm_id, &attr, &attr_mask);
+	if (rc) {
+		SPDK_ERRLOG("XRC INI RTR: rdma_init_qp_attr failed rc=%d errno=%d\n", rc, errno);
+		return rc;
+	}
+	attr.dest_qp_num = remote_tgt_qpn;
+	SPDK_NOTICELOG("XRC INI RTR: qpn=%u dest_qpn=%u path_mtu=%d dlid=%u rq_psn=%u\n",
+		       ini_qp->qp_num, attr.dest_qp_num, attr.path_mtu,
+		       attr.ah_attr.dlid, attr.rq_psn);
+	rc = ibv_modify_qp(ini_qp, &attr,
+			   IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+			   IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
+			   IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
+	if (rc) {
+		SPDK_ERRLOG("XRC INI RTR: ibv_modify_qp failed rc=%d errno=%d\n", rc, errno);
+		return rc;
+	}
+
+	memset(&attr, 0, sizeof(attr));
+	attr.qp_state = IBV_QPS_RTS;
+	rc = rdma_init_qp_attr(cm_id, &attr, &attr_mask);
+	if (rc) {
+		SPDK_ERRLOG("XRC INI RTS: rdma_init_qp_attr failed rc=%d errno=%d\n", rc, errno);
+		return rc;
+	}
+	SPDK_NOTICELOG("XRC INI RTS: qpn=%u sq_psn=%u timeout=%u retry=%u rnr=%u rd_atomic=%u\n",
+		       ini_qp->qp_num, attr.sq_psn, attr.timeout,
+		       attr.retry_cnt, attr.rnr_retry, attr.max_rd_atomic);
+	rc = ibv_modify_qp(ini_qp, &attr,
+			   IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+			   IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC);
+	if (rc) {
+		SPDK_ERRLOG("XRC INI RTS: ibv_modify_qp failed rc=%d errno=%d\n", rc, errno);
+		return rc;
+	}
+	SPDK_NOTICELOG("XRC INI QP qpn=%u is RTS\n", ini_qp->qp_num);
+
+	/* ---- TGT QP (XRC_RECV): INIT → RTR → RTS (stripped RTS mask) ---- */
+	memset(&attr, 0, sizeof(attr));
+	attr.qp_state = IBV_QPS_INIT;
+	rc = rdma_init_qp_attr(cm_id, &attr, &attr_mask);
+	if (rc) {
+		SPDK_ERRLOG("XRC TGT INIT: rdma_init_qp_attr failed rc=%d errno=%d\n", rc, errno);
+		return rc;
+	}
+	attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
+	SPDK_NOTICELOG("XRC TGT INIT: qpn=%u pkey_idx=%u port=%u mask=0x%x\n",
+		       tgt_qp->qp_num, attr.pkey_index, attr.port_num, attr_mask);
+	rc = ibv_modify_qp(tgt_qp, &attr,
+			   IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+	if (rc) {
+		SPDK_ERRLOG("XRC TGT INIT: ibv_modify_qp failed rc=%d errno=%d\n", rc, errno);
+		return rc;
+	}
+
+	memset(&attr, 0, sizeof(attr));
+	attr.qp_state = IBV_QPS_RTR;
+	rc = rdma_init_qp_attr(cm_id, &attr, &attr_mask);
+	if (rc) {
+		SPDK_ERRLOG("XRC TGT RTR: rdma_init_qp_attr failed rc=%d errno=%d\n", rc, errno);
+		return rc;
+	}
+	attr.dest_qp_num = remote_ini_qpn;
+	SPDK_NOTICELOG("XRC TGT RTR: qpn=%u dest_qpn=%u path_mtu=%d dlid=%u rq_psn=%u\n",
+		       tgt_qp->qp_num, attr.dest_qp_num, attr.path_mtu,
+		       attr.ah_attr.dlid, attr.rq_psn);
+	rc = ibv_modify_qp(tgt_qp, &attr,
+			   IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+			   IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
+			   IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
+	if (rc) {
+		SPDK_ERRLOG("XRC TGT RTR: ibv_modify_qp failed rc=%d errno=%d\n", rc, errno);
+		return rc;
+	}
+
+	/* XRC_RECV RTS: only STATE + SQ_PSN — no retry/timeout fields */
+	memset(&attr, 0, sizeof(attr));
+	attr.qp_state = IBV_QPS_RTS;
+	attr.sq_psn   = 0;
+	SPDK_NOTICELOG("XRC TGT RTS: qpn=%u sq_psn=0\n", tgt_qp->qp_num);
+	rc = ibv_modify_qp(tgt_qp, &attr, IBV_QP_STATE | IBV_QP_SQ_PSN);
+	if (rc) {
+		SPDK_ERRLOG("XRC TGT RTS: ibv_modify_qp failed rc=%d errno=%d\n", rc, errno);
+		return rc;
+	}
+	SPDK_NOTICELOG("XRC TGT QP qpn=%u is RTS\n", tgt_qp->qp_num);
+	return 0;
+}
+
 static int
 nvmf_rdma_poller_create(struct spdk_nvmf_rdma_transport *rtransport,
 			struct spdk_nvmf_rdma_poll_group *rgroup, struct spdk_nvmf_rdma_device *device,
@@ -4480,6 +4792,79 @@ nvmf_rdma_poller_create(struct spdk_nvmf_rdma_transport *rtransport,
 		return -1;
 	}
 	poller->num_cqe = num_cqe;
+
+	/* XRC: open XRCD once per device (lazy), then create per-poller XRC SRQ */
+	if (rtransport->rdma_opts.xrc) {
+		int xrc_cqe = poller->max_srq_depth ? poller->max_srq_depth :
+			      rtransport->transport.opts.max_queue_depth;
+		poller->xrc_cq = ibv_create_cq(device->context, xrc_cqe * 2, NULL, NULL, 0);
+		if (!poller->xrc_cq) {
+			SPDK_ERRLOG("XRC: ibv_create_cq failed on device %s errno=%d\n",
+				    ibv_get_device_name(device->context->device), errno);
+			goto xrc_done;
+		}
+		SPDK_NOTICELOG("XRC: poller %p created xrc_cq %p cqe=%d on device %s\n",
+			       poller, poller->xrc_cq, xrc_cqe * 2,
+			       ibv_get_device_name(device->context->device));
+
+		if (device->xrcd == NULL) {
+			char xrcd_path[128];
+			struct ibv_xrcd_init_attr xa = {};
+
+			snprintf(xrcd_path, sizeof(xrcd_path), "/tmp/spdk_xrcd_%s",
+				 ibv_get_device_name(device->context->device));
+			device->xrcd_fd = open(xrcd_path, O_RDONLY | O_CREAT, 0600);
+			if (device->xrcd_fd < 0) {
+				SPDK_WARNLOG("XRC: open('%s') failed (%s), using fd=-1\n",
+					     xrcd_path, strerror(errno));
+			}
+			xa.comp_mask = IBV_XRCD_INIT_ATTR_FD | IBV_XRCD_INIT_ATTR_OFLAGS;
+			xa.fd        = device->xrcd_fd;
+			xa.oflags    = O_CREAT;
+			device->xrcd  = ibv_open_xrcd(device->context, &xa);
+			if (!device->xrcd) {
+				SPDK_ERRLOG("XRC: ibv_open_xrcd failed on device %s errno=%d\n",
+					    ibv_get_device_name(device->context->device), errno);
+				/* non-fatal for the existing RC path */
+				goto xrc_done;
+			}
+			SPDK_NOTICELOG("XRC: opened XRCD %p on device %s fd=%d path=%s\n",
+				       device->xrcd,
+				       ibv_get_device_name(device->context->device),
+				       device->xrcd_fd, xrcd_path);
+		}
+
+		{
+			struct ibv_srq_init_attr_ex srq_ex = {};
+			srq_ex.comp_mask = IBV_SRQ_INIT_ATTR_TYPE | IBV_SRQ_INIT_ATTR_XRCD |
+					   IBV_SRQ_INIT_ATTR_CQ   | IBV_SRQ_INIT_ATTR_PD;
+			srq_ex.srq_type  = IBV_SRQT_XRC;
+			srq_ex.xrcd      = device->xrcd;
+			srq_ex.cq        = poller->xrc_cq;
+			srq_ex.pd        = device->pd;
+			srq_ex.attr.max_wr  = poller->max_srq_depth ? poller->max_srq_depth :
+					      rtransport->transport.opts.max_queue_depth;
+			srq_ex.attr.max_sge = 1;
+
+			poller->xrc_srq = ibv_create_srq_ex(device->context, &srq_ex);
+			if (!poller->xrc_srq) {
+				SPDK_ERRLOG("XRC: ibv_create_srq_ex failed on poller %p errno=%d\n",
+					    poller, errno);
+				goto xrc_done;
+			}
+			if (ibv_get_srq_num(poller->xrc_srq, &poller->xrc_srqn) != 0) {
+				SPDK_ERRLOG("XRC: ibv_get_srq_num failed errno=%d\n", errno);
+				ibv_destroy_srq(poller->xrc_srq);
+				poller->xrc_srq = NULL;
+				goto xrc_done;
+			}
+			SPDK_NOTICELOG("XRC: poller %p created XRC SRQ %p srqn=%u cq=%p max_wr=%u\n",
+				       poller, poller->xrc_srq, poller->xrc_srqn,
+				       poller->xrc_cq, srq_ex.attr.max_wr);
+		}
+xrc_done:;
+	}
+
 	return 0;
 }
 
@@ -4643,6 +5028,18 @@ nvmf_rdma_poller_destroy(struct spdk_nvmf_rdma_poller *poller)
 		}
 		spdk_rdma_provider_srq_destroy(poller->srq);
 		SPDK_DEBUGLOG(rdma, "Destroyed RDMA shared queue %p\n", poller->srq);
+	}
+
+	/* XRC: destroy XRC SRQ then the dedicated XRC CQ */
+	if (poller->xrc_srq) {
+		SPDK_NOTICELOG("XRC: destroying XRC SRQ %p srqn=%u on poller %p\n",
+			       poller->xrc_srq, poller->xrc_srqn, poller);
+		ibv_destroy_srq(poller->xrc_srq);
+		poller->xrc_srq = NULL;
+	}
+	if (poller->xrc_cq) {
+		ibv_destroy_cq(poller->xrc_cq);
+		poller->xrc_cq = NULL;
 	}
 
 	if (poller->cq) {

@@ -282,6 +282,7 @@ static char *g_sock_threshold_impl;
 static uint8_t g_transport_tos = 0;
 
 static uint32_t g_rdma_srq_size;
+static bool g_rdma_xrc;
 static struct spdk_key *g_psk = NULL;
 
 /* Burst experiment parameters */
@@ -2323,6 +2324,7 @@ usage(char *program_name)
 	printf("==== RDMA OPTIONS ====\n\n");
 	printf("\t--transport-tos <val> specify the type of service for RDMA transport. Default: 0 (disabled)\n");
 	printf("\t--rdma-srq-size <val> The size of a shared rdma receive queue. Default: 0 (disabled)\n");
+	printf("\t--rdma-xrc            Enable XRC QP setup alongside RC (logs XRC XRCD/SRQ/QP creation)\n");
 	printf("\t-k, --keepalive <ms> keep alive timeout period in millisecond\n");
 	printf("\n");
 
@@ -2814,6 +2816,8 @@ static const struct option g_perf_cmdline_opts[] = {
 	{"transport-tos", required_argument, NULL, PERF_TRANSPORT_TOS},
 #define PERF_RDMA_SRQ_SIZE	268
 	{"rdma-srq-size", required_argument, NULL, PERF_RDMA_SRQ_SIZE},
+#define PERF_RDMA_XRC		277
+	{"rdma-xrc", no_argument, NULL, PERF_RDMA_XRC},
 #define PERF_USE_EVERY_CORE	269
 	{"use-every-core", no_argument, NULL, PERF_USE_EVERY_CORE},
 #define PERF_NO_HUGE		270
@@ -3123,6 +3127,9 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 		case PERF_USE_EVERY_CORE:
 			g_use_every_core = true;
 			break;
+		case PERF_RDMA_XRC:
+			g_rdma_xrc = true;
+			break;
 		case PERF_DISABLE_ZCOPY_RECV:
 			perf_set_sock_opts(optarg, "enable_zerocopy_recv", 0, NULL);
 			break;
@@ -3256,11 +3263,16 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 		return 1;
 	}
 
-	if (g_rdma_srq_size != 0) {
+	if (g_rdma_srq_size != 0 || g_rdma_xrc) {
 		struct spdk_nvme_transport_opts opts;
 
 		spdk_nvme_transport_get_opts(&opts, sizeof(opts));
-		opts.rdma_srq_size = g_rdma_srq_size;
+		if (g_rdma_srq_size != 0) {
+			opts.rdma_srq_size = g_rdma_srq_size;
+		}
+		if (g_rdma_xrc) {
+			opts.rdma_xrc = true;
+		}
 
 		rc = spdk_nvme_transport_set_opts(&opts, sizeof(opts));
 		if (rc != 0) {

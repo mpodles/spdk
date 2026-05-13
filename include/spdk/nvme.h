@@ -4985,8 +4985,15 @@ struct spdk_nvme_transport_opts {
 	 */
 	bool rdma_umr_per_io;
 
-	/* Hole at byte 31. */
-	uint8_t reserved23;
+	/**
+	 * It is used for RDMA transport.
+	 *
+	 * When set, enables XRC (eXtended Reliable Connected) QP transport alongside
+	 * the existing RC path.  Each qpair creates an XRC_SEND + XRC_RECV QP pair and
+	 * a per-qpair XRC SRQ.  XRC QPNs and SRQ numbers are exchanged in CM private data.
+	 * This flag is for development/logging purposes; the RC path remains active.
+	 */
+	bool rdma_xrc;
 
 	/**
 	 * Time in msec to wait until connection is done (0 = no timeout).

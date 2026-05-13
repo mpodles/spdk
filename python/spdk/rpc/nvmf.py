@@ -125,6 +125,7 @@ def nvmf_create_transport(client, **params):
         acceptor_backlog: Pending connections allowed at one time - RDMA specific (optional)
         abort_timeout_sec: Abort execution timeout value, in seconds (optional)
         no_wr_batching: Boolean flag to disable work requests batching - RDMA specific (optional)
+        xrc: Boolean flag to enable XRC QP setup alongside RC path - RDMA specific (optional)
         control_msg_num: The number of control messages per poll group - TCP specific (optional)
         disable_mappable_bar0: disable client mmap() of BAR0 - VFIO-USER specific (optional)
         disable_adaptive_irq: Disable adaptive interrupt feature - VFIO-USER specific (optional)
