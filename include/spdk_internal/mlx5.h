@@ -338,10 +338,13 @@ int spdk_mlx5_cq_destroy(struct spdk_mlx5_cq *cq);
  *
  * \param pd Protection Domain
  * \param srq_attr Attributes to be used to create SRQ
+ * \param xrcd XRC domain; NULL creates a plain IBV_SRQT_BASIC SRQ
+ * \param xrc_cq CQ for the XRC SRQ (required when xrcd != NULL, ignored otherwise)
  * \param srq_out Pointer created SRQ
  * \return 0 on success, negated errno on failure. \b srq_out is set only on success result
  */
 int spdk_mlx5_srq_create(struct ibv_pd *pd, struct ibv_srq_init_attr *srq_attr,
+			 struct ibv_xrcd *xrcd, struct ibv_cq *xrc_cq,
 			 struct spdk_mlx5_srq **srq_out);
 
 /**
@@ -351,6 +354,16 @@ int spdk_mlx5_srq_create(struct ibv_pd *pd, struct ibv_srq_init_attr *srq_attr,
  * \return 0 on success, negated errno on failure.
  */
 int spdk_mlx5_srq_destroy(struct spdk_mlx5_srq *srq);
+
+/**
+ * Return the underlying verbs ibv_srq pointer for an mlx5 SRQ.
+ * Needed by callers that must pass the srq to verbs APIs (e.g. ibv_get_srq_num)
+ * without direct access to the opaque struct spdk_mlx5_srq internals.
+ *
+ * \param srq SRQ created with \ref spdk_mlx5_srq_create
+ * \return ibv_srq pointer, or NULL if \b srq is NULL.
+ */
+struct ibv_srq *spdk_mlx5_srq_get_verbs_srq(struct spdk_mlx5_srq *srq);
 
 /**
  * Create qpair suitable for RDMA operations

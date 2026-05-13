@@ -59,12 +59,18 @@ struct spdk_rdma_provider_qp {
 	struct spdk_rdma_provider_recv_wr_list recv_wrs;
 	struct spdk_rdma_provider_qp_stats *stats;
 	bool shared_stats;
+	/* XRC: set after XRC QPs reach RTS; provider stamps remote_srqn on every send WR */
+	bool xrc_mode;
+	uint32_t remote_srqn;
 };
 
 struct spdk_rdma_provider_srq_init_attr {
 	struct ibv_pd *pd;
 	struct spdk_rdma_provider_wr_stats *stats;
 	struct ibv_srq_init_attr srq_init_attr;
+	/* XRC: set both to create an IBV_SRQT_XRC SRQ instead of a plain SRQ */
+	struct ibv_xrcd *xrcd;   /* NULL → plain SRQ */
+	struct ibv_cq   *xrc_cq; /* required when xrcd != NULL */
 };
 
 struct spdk_rdma_provider_srq {
@@ -72,6 +78,8 @@ struct spdk_rdma_provider_srq {
 	struct spdk_rdma_provider_recv_wr_list recv_wrs;
 	struct spdk_rdma_provider_wr_stats *stats;
 	bool shared_stats;
+	/* Non-zero for XRC SRQs; populated via ibv_get_srq_num() on creation */
+	uint32_t srqn;
 };
 
 struct spdk_rdma_provider_cq_init_attr {

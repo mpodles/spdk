@@ -290,6 +290,30 @@ spdk_rdma_provider_qp_queue_send_wrs(struct spdk_rdma_provider_qp *spdk_rdma_qp,
 	is_first = spdk_rdma_qp->send_wrs.first == NULL;
 	dv_qp = SPDK_CONTAINEROF(spdk_rdma_qp, struct spdk_rdma_mlx5_dv_qp, common);
 
+	if (spdk_unlikely(spdk_rdma_qp->xrc_mode)) {
+		/*
+		 * XRC send path: stamp remote_srqn on every WR, then submit the whole
+		 * chain immediately via ibv_post_send (handles doorbell internally).
+		 * We do NOT enqueue into send_wrs — ibv_post_send owns submission.
+		 */
+		struct ibv_send_wr *bad_wr = NULL;
+		int xrc_rc;
+
+		for (tmp = first; tmp != NULL; tmp = tmp->next) {
+			tmp->qp_type.xrc.remote_srqn = spdk_rdma_qp->remote_srqn;
+			spdk_rdma_qp->stats->send.num_submitted_wrs++;
+		}
+		xrc_rc = ibv_post_send(spdk_rdma_qp->qp, first, &bad_wr);
+		if (spdk_unlikely(xrc_rc)) {
+			SPDK_ERRLOG("XRC ibv_post_send failed rc=%d errno=%d\n", xrc_rc, errno);
+			dv_qp->send_err = xrc_rc;
+		}
+		/* send_wrs chain is consumed; do not let flush_send_wrs ring MLX5 doorbell */
+		spdk_rdma_qp->send_wrs.first = NULL;
+		spdk_rdma_qp->send_wrs.last  = NULL;
+		return is_first;
+	}
+
 	if (is_first) {
 		spdk_rdma_qp->send_wrs.first = first;
 	} else {
@@ -318,12 +342,20 @@ spdk_rdma_provider_qp_flush_send_wrs(struct spdk_rdma_provider_qp *spdk_rdma_qp,
 	assert(bad_wr);
 	assert(spdk_rdma_qp);
 
+	dv_qp = SPDK_CONTAINEROF(spdk_rdma_qp, struct spdk_rdma_mlx5_dv_qp, common);
+
+	if (spdk_unlikely(spdk_rdma_qp->xrc_mode)) {
+		/*
+		 * XRC sends were already submitted (and doorbell rung) inside
+		 * queue_send_wrs via ibv_post_send.  Nothing left to flush.
+		 */
+		return dv_qp->send_err;
+	}
 
 	if (spdk_unlikely(spdk_rdma_qp->send_wrs.first == NULL)) {
 		return 0;
 	}
 
-	dv_qp = SPDK_CONTAINEROF(spdk_rdma_qp, struct spdk_rdma_mlx5_dv_qp, common);
 	if (spdk_unlikely(dv_qp->send_err)) {
 		/* If send_err is not zero that means that no WRs are posted to NIC */
 		*bad_wr = spdk_rdma_qp->send_wrs.first;
@@ -364,10 +396,27 @@ spdk_rdma_provider_srq_create(struct spdk_rdma_provider_srq_init_attr *init_attr
 		}
 	}
 
-	rc = spdk_mlx5_srq_create(init_attr->pd, &init_attr->srq_init_attr, &dv_srq->mlx5_srq);
+	rc = spdk_mlx5_srq_create(init_attr->pd, &init_attr->srq_init_attr,
+				  init_attr->xrcd, init_attr->xrc_cq,
+				  &dv_srq->mlx5_srq);
 	if (rc) {
 		SPDK_ERRLOG("Unable to create SRQ, rc %d (%s)\n", rc, spdk_strerror(rc));
 		goto err_free_stats;
+	}
+
+	/* Populate the verbs SRQ pointer (used by callers for ibv_post_recv / logging) */
+	rdma_srq->srq = spdk_mlx5_srq_get_verbs_srq(dv_srq->mlx5_srq);
+
+	if (init_attr->xrcd != NULL) {
+		/* Retrieve the hardware SRQ number — needed by remote sides as remote_srqn */
+		if (ibv_get_srq_num(rdma_srq->srq, &rdma_srq->srqn) != 0) {
+			SPDK_ERRLOG("ibv_get_srq_num failed errno=%d\n", errno);
+			spdk_mlx5_srq_destroy(dv_srq->mlx5_srq);
+			dv_srq->mlx5_srq = NULL;
+			goto err_free_stats;
+		}
+		SPDK_NOTICELOG("XRC provider SRQ: srq=%p srqn=%u (via ibv_get_srq_num)\n",
+			       rdma_srq->srq, rdma_srq->srqn);
 	}
 
 	return rdma_srq;

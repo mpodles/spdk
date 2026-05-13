@@ -823,6 +823,7 @@ mlx5_srq_fill_buf(struct spdk_mlx5_srq *srq)
 
 int
 spdk_mlx5_srq_create(struct ibv_pd *pd, struct ibv_srq_init_attr *srq_attr,
+		     struct ibv_xrcd *xrcd, struct ibv_cq *xrc_cq,
 		     struct spdk_mlx5_srq **srq_out)
 {
 	struct spdk_mlx5_srq *srq;
@@ -836,16 +837,31 @@ spdk_mlx5_srq_create(struct ibv_pd *pd, struct ibv_srq_init_attr *srq_attr,
 	};
 	int rc;
 
-	SPDK_DEBUGLOG(mlx5, "Create SRQ: max_wr %u, max_sge %u\n", srq_attr->attr.max_wr,
-		      srq_attr->attr.max_sge);
+	SPDK_DEBUGLOG(mlx5, "Create SRQ: max_wr %u, max_sge %u xrc=%s\n", srq_attr->attr.max_wr,
+		      srq_attr->attr.max_sge, xrcd ? "yes" : "no");
 	srq = calloc(1, sizeof(*srq));
 	if (!srq) {
 		return -ENOMEM;
 	}
 
-	srq->verbs_srq = ibv_create_srq(pd, srq_attr);
+	if (xrcd != NULL) {
+		/* XRC SRQ path — must use ibv_create_srq_ex with IBV_SRQT_XRC */
+		struct ibv_srq_init_attr_ex ex = {
+			.comp_mask = IBV_SRQ_INIT_ATTR_TYPE | IBV_SRQ_INIT_ATTR_XRCD |
+				     IBV_SRQ_INIT_ATTR_CQ   | IBV_SRQ_INIT_ATTR_PD,
+			.srq_type  = IBV_SRQT_XRC,
+			.xrcd      = xrcd,
+			.cq        = xrc_cq,
+			.pd        = pd,
+			.attr      = srq_attr->attr,
+		};
+		srq->verbs_srq = ibv_create_srq_ex(pd->context, &ex);
+	} else {
+		srq->verbs_srq = ibv_create_srq(pd, srq_attr);
+	}
 	if (!srq->verbs_srq) {
-		SPDK_ERRLOG("Failed to create SRQ, rc %d (%s)\n", errno, spdk_strerror(errno));
+		SPDK_ERRLOG("Failed to create SRQ (xrc=%s), rc %d (%s)\n",
+			    xrcd ? "yes" : "no", errno, spdk_strerror(errno));
 		rc = -errno;
 		goto err_free_srq;
 	}
@@ -912,6 +928,12 @@ spdk_mlx5_srq_destroy(struct spdk_mlx5_srq *srq)
 	free(srq);
 
 	return rc;
+}
+
+struct ibv_srq *
+spdk_mlx5_srq_get_verbs_srq(struct spdk_mlx5_srq *srq)
+{
+	return srq ? srq->verbs_srq : NULL;
 }
 
 int

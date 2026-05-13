@@ -10,6 +10,7 @@
 
 	spdk_mlx5_srq_create;
 	spdk_mlx5_srq_destroy;
+	spdk_mlx5_srq_get_verbs_srq;
 	spdk_mlx5_srq_complete_recv;
 	spdk_mlx5_srq_recv;
 
