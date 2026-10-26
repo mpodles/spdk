@@ -1,0 +1,125 @@
+/*   SPDX-License-Identifier: BSD-3-Clause
+ *   Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ */
+
+/*
+ * NVMe-oF/RDMA over XRC: the non-standard wire format both ends of this fork
+ * use when XRC is enabled on both sides (target transport option "xrc",
+ * host transport option rdma_xrc). Admin queues stay RC and never carry it.
+ *
+ * Topology (W target poll groups, one host):
+ *   host I/O queue q:  XRC INI QP q  --commands-->  target XRC TGT QP q
+ *                      (the SEND names one of the W target command SRQs)
+ *   target poll group w: one XRC INI QP per host  --READ/WRITE/response-->
+ *                      host XRC TGT QP w (one per target poll group)
+ *                      (responses name the SRQ of the host poller that owns q)
+ *
+ * Connection setup, per host I/O queue, on top of the usual RDMA-CM
+ * exchange. The CM pairs host INI QP q with target TGT QP q: their QPNs and
+ * PSNs travel in the CM REQ/REP as for RC, and both sides take the path from
+ * rdma_init_qp_attr(). The rest:
+ *
+ *  1. CM REQ private data (host -> target):
+ *     spdk_nvmf_rdma_xrc_request_private_data. The session id groups all I/O
+ *     queues of one host incarnation (one host NQN + host ID, chosen at random
+ *     by the host each time it creates its XRC resources for a controller).
+ *  2. CM REP private data (target -> host):
+ *     spdk_nvmf_rdma_xrc_accept_private_data + W command SRQNs + W target INI
+ *     QPNs (one INI QP per (poll group, session)). The target creates the INI
+ *     QPs when the session's first queue connects.
+ *  3. The host creates one XRC TGT QP per target poll group (first queue of
+ *     the session only), connects each to the matching target INI QP, moves
+ *     INI QP q to RTS and calls rdma_establish().
+ *  4. Fabrics Connect data (host -> target), reserved bytes at offset 18:
+ *     spdk_nvmf_rdma_xrc_connect_ext with the host TGT QPNs. The target
+ *     connects its INI QPs when it processes the first Fabrics Connect of the
+ *     session, before it sends that Connect's response. Connect data must
+ *     travel in the capsule: the INI QPs that could RDMA-READ it are not
+ *     connected yet.
+ *
+ * QPs connected outside RDMA-CM (target INI w <-> host TGT w) use
+ * PSN = INI QPN & 0xffffff in both directions' bookkeeping.
+ */
+
+#ifndef SPDK_INTERNAL_NVMF_RDMA_XRC_H
+#define SPDK_INTERNAL_NVMF_RDMA_XRC_H
+
+#include "spdk/stdinc.h"
+#include "spdk/assert.h"
+
+#define SPDK_NVMF_RDMA_XRC_MAGIC	0x5852	/* "XR" */
+#define SPDK_NVMF_RDMA_XRC_VERSION	1
+
+/* REP private data is at most 196 bytes: 32 + 8 * W. */
+#define SPDK_NVMF_RDMA_XRC_MAX_WORKERS	20
+
+/* SQHD sent in every XRC response: commands of one queue complete on several
+ * cores, and the SPDK host ignores SQHD on RDMA. */
+#define SPDK_NVMF_RDMA_XRC_SQHD		0xFFFF
+
+/* Steering policies of the host (spdk_nvme_transport_opts.rdma_xrc_steering). */
+enum spdk_nvme_rdma_xrc_steering {
+	/* Every command to the queue's own target poll group (stock placement). */
+	SPDK_NVME_RDMA_XRC_STEER_HOME	= 0,
+	/* Round-robin over the target poll groups, per queue. */
+	SPDK_NVME_RDMA_XRC_STEER_RR	= 1,
+	/* Uniformly random target poll group per command. */
+	SPDK_NVME_RDMA_XRC_STEER_RANDOM	= 2,
+};
+
+struct __attribute__((packed)) spdk_nvmf_rdma_xrc_request_private_data {
+	/* Same first 10 bytes as spdk_nvmf_rdma_request_private_data. */
+	uint16_t	recfmt;
+	uint16_t	qid;
+	uint16_t	hrqsize;
+	uint16_t	hsqsize;
+	uint16_t	cntlid;
+	/* XRC extension, in the standard struct's reserved bytes. */
+	uint16_t	xrc_magic;
+	uint8_t		xrc_version;
+	uint8_t		reserved1;
+	/* SRQ of the host poller owning this queue: responses go there. */
+	uint32_t	resp_srqn;
+	uint64_t	session_id;
+	uint8_t		reserved2[6];
+};
+SPDK_STATIC_ASSERT(sizeof(struct spdk_nvmf_rdma_xrc_request_private_data) == 32,
+		   "Incorrect size");
+
+struct __attribute__((packed)) spdk_nvmf_rdma_xrc_accept_private_data {
+	/* Same first 4 bytes as spdk_nvmf_rdma_accept_private_data. */
+	uint16_t	recfmt;
+	uint16_t	crqsize;
+	uint16_t	xrc_magic;
+	uint8_t		xrc_version;
+	uint8_t		num_workers;
+	/* Index of the poll group that owns this queue (its home SRQ). */
+	uint8_t		home;
+	uint8_t		reserved1[3];
+	uint32_t	tgt_qpn;
+	uint8_t		reserved2[16];
+	/* Followed by uint32_t srqn[num_workers], uint32_t ini_qpn[num_workers]. */
+	uint32_t	data[];
+};
+SPDK_STATIC_ASSERT(sizeof(struct spdk_nvmf_rdma_xrc_accept_private_data) == 32,
+		   "Incorrect size");
+
+/* Lives in spdk_nvmf_fabric_connect_data.reserved5 (offset 18, 238 bytes). */
+struct __attribute__((packed)) spdk_nvmf_rdma_xrc_connect_ext {
+	uint16_t	xrc_magic;
+	uint8_t		xrc_version;
+	uint8_t		num_tgt;
+	uint64_t	session_id;
+	uint32_t	tgt_qpn[SPDK_NVMF_RDMA_XRC_MAX_WORKERS];
+};
+SPDK_STATIC_ASSERT(sizeof(struct spdk_nvmf_rdma_xrc_connect_ext) <= 238, "Incorrect size");
+
+#define SPDK_NVMF_RDMA_XRC_CONNECT_EXT_OFFSET	18
+
+static inline uint32_t
+spdk_nvmf_rdma_xrc_psn(uint32_t ini_qpn)
+{
+	return ini_qpn & 0xffffff;
+}
+
+#endif /* SPDK_INTERNAL_NVMF_RDMA_XRC_H */

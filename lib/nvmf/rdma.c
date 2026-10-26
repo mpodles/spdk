@@ -20,6 +20,7 @@
 #include "spdk/log.h"
 #include "spdk_internal/rdma_provider.h"
 #include "spdk_internal/rdma_utils.h"
+#include "spdk_internal/nvmf_rdma_xrc.h"
 
 #include "nvmf_internal.h"
 #include "transport.h"
@@ -221,6 +222,9 @@ struct spdk_nvmf_rdma_recv {
 
 	struct spdk_nvmf_rdma_qpair		*qpair;
 
+	/* The SRQ this receive is posted to, NULL without SRQ. */
+	struct spdk_rdma_provider_srq		*srq;
+
 	/* In-capsule data buffer */
 	uint8_t					*buf;
 
@@ -311,6 +315,68 @@ struct spdk_nvmf_rdma_resources {
 	STAILQ_HEAD(, spdk_nvmf_rdma_request)	free_queue;
 };
 
+/*
+ * Send side of an RDMA QP: the WR batch being built, the send and RDMA READ
+ * depth and the requests waiting for either. On RC every qpair owns one
+ * (spdk_nvmf_rdma_qpair.own_sq). Under XRC one belongs to each INI QP
+ * (poll group, host) and is shared by every queue of that host whose commands
+ * the poll group runs, so data and response of a command always leave on the
+ * QP of the core that ran it.
+ */
+struct spdk_nvmf_rdma_sq {
+	struct spdk_rdma_provider_qp		*rdma_qp;
+
+	/* The maximum number of active RDMA READ and ATOMIC operations at one time */
+	uint16_t				max_read_depth;
+
+	/* The current number of active RDMA READ operations */
+	uint16_t				current_read_depth;
+
+	/* The maximum number of RDMA SEND operations at one time */
+	uint32_t				max_send_depth;
+
+	/* The current number of posted WRs from this send queue.
+	 * Should not exceed max_send_depth. */
+	uint32_t				current_send_depth;
+
+	STAILQ_HEAD(, spdk_nvmf_rdma_request)	pending_rdma_read_queue;
+
+	STAILQ_HEAD(, spdk_nvmf_rdma_request)	pending_rdma_write_queue;
+
+	STAILQ_HEAD(, spdk_nvmf_rdma_request)	pending_rdma_send_queue;
+
+	STAILQ_ENTRY(spdk_nvmf_rdma_sq)		send_link;
+
+	/* Requests in pending_rdma_read_queue now and at most, and how often its
+	 * head waited for READ credits or send slots. */
+	uint32_t				pending_read_len;
+	uint32_t				pending_read_peak;
+	uint64_t				read_stalls;
+
+	/* XRC only: the INI QP this belongs to, NULL on RC. */
+	struct spdk_nvmf_rdma_xrc_ini		*xrc_ini;
+};
+
+struct spdk_nvmf_rdma_xrc_qpair;
+struct spdk_nvmf_rdma_xrc_ini;
+
+#define NVMF_RDMA_SQ_READ_INSERT(_sq, _req) do {						\
+	STAILQ_INSERT_TAIL(&(_sq)->pending_rdma_read_queue, (_req), state_link);		\
+	if (++(_sq)->pending_read_len > (_sq)->pending_read_peak) {				\
+		(_sq)->pending_read_peak = (_sq)->pending_read_len;				\
+	}											\
+} while (0)
+
+#define NVMF_RDMA_SQ_READ_REMOVE(_sq, _req) do {						\
+	STAILQ_REMOVE(&(_sq)->pending_rdma_read_queue, (_req), spdk_nvmf_rdma_request, state_link); \
+	(_sq)->pending_read_len--;								\
+} while (0)
+
+#define NVMF_RDMA_SQ_READ_REMOVE_HEAD(_sq) do {						\
+	STAILQ_REMOVE_HEAD(&(_sq)->pending_rdma_read_queue, state_link);			\
+	(_sq)->pending_read_len--;								\
+} while (0)
+
 typedef void (*spdk_nvmf_rdma_qpair_ibv_event)(struct spdk_nvmf_rdma_qpair *rqpair);
 
 typedef void (*spdk_poller_destroy_cb)(void *ctx);
@@ -336,35 +402,23 @@ struct spdk_nvmf_rdma_qpair {
 	/* The maximum number of I/O outstanding on this connection at one time */
 	uint16_t				max_queue_depth;
 
-	/* The maximum number of active RDMA READ and ATOMIC operations at one time */
-	uint16_t				max_read_depth;
-
-	/* The maximum number of RDMA SEND operations at one time */
-	uint32_t				max_send_depth;
-
 	/* The current number of outstanding WRs from this qpair's
 	 * recv queue. Should not exceed device->attr.max_queue_depth.
 	 */
 	uint16_t				current_recv_depth;
-
-	/* The current number of active RDMA READ operations */
-	uint16_t				current_read_depth;
-
-	/* The current number of posted WRs from this qpair's
-	 * send queue. Should not exceed max_send_depth.
-	 */
-	uint32_t				current_send_depth;
 
 	/* The maximum number of SGEs per WR on the send queue */
 	uint32_t				max_send_sge;
 
 	struct spdk_nvmf_rdma_resources		*resources;
 
-	STAILQ_HEAD(, spdk_nvmf_rdma_request)	pending_rdma_read_queue;
+	/* Send side used by this qpair's requests: &own_sq on RC; under XRC the
+	 * send state of the INI QP (poll group, host) that this qpair posts on. */
+	struct spdk_nvmf_rdma_sq		*sq;
+	struct spdk_nvmf_rdma_sq		own_sq;
 
-	STAILQ_HEAD(, spdk_nvmf_rdma_request)	pending_rdma_write_queue;
-
-	STAILQ_HEAD(, spdk_nvmf_rdma_request)	pending_rdma_send_queue;
+	/* XRC state, NULL on RC (see struct spdk_nvmf_rdma_xrc_qpair). */
+	struct spdk_nvmf_rdma_xrc_qpair		*xrc;
 
 	/* Number of requests not in the free state */
 	uint32_t				qd;
@@ -376,8 +430,6 @@ struct spdk_nvmf_rdma_qpair {
 	RB_ENTRY(spdk_nvmf_rdma_qpair)		node;
 
 	STAILQ_ENTRY(spdk_nvmf_rdma_qpair)	recv_link;
-
-	STAILQ_ENTRY(spdk_nvmf_rdma_qpair)	send_link;
 
 	/* Points to the a request that has fuse bits set to
 	 * SPDK_NVME_CMD_FUSE_FIRST, when the qpair is waiting
@@ -411,6 +463,13 @@ struct spdk_nvmf_rdma_poller_stat {
 	uint64_t				pending_rdma_write;
 	uint64_t				pending_rdma_send;
 	struct spdk_rdma_provider_qp_stats	qp_stats;
+	/* XRC: commands received on this poller's XRC SRQ. */
+	uint64_t				xrc_requests;
+	/* XRC: receives for a TGT QP with no live queue (reposted, dropped). */
+	uint64_t				xrc_orphan_recvs;
+	/* XRC: shadow qpairs created / destroyed on this poller. */
+	uint64_t				xrc_shadows_created;
+	uint64_t				xrc_shadows_destroyed;
 };
 
 struct spdk_nvmf_rdma_poller {
@@ -429,6 +488,16 @@ struct spdk_nvmf_rdma_poller {
 	struct spdk_rdma_provider_srq		*srq;
 
 	struct spdk_nvmf_rdma_resources		*resources;
+
+	/* XRC: the command SRQ of this (poll group, device), its number and
+	 * receive resources. Every host queue may send commands here. */
+	struct spdk_rdma_provider_srq		*xrc_srq;
+	uint32_t				xrc_srqn;
+	uint32_t				max_xrc_srq_depth;
+	struct spdk_nvmf_rdma_resources		*xrc_resources;
+	/* XRC receive buffers taken off the SRQ and not yet reposted. */
+	uint32_t				xrc_recvs_held;
+
 	struct spdk_nvmf_rdma_poller_stat	stat;
 
 	spdk_poller_destroy_cb			destroy_cb;
@@ -438,7 +507,7 @@ struct spdk_nvmf_rdma_poller {
 
 	STAILQ_HEAD(, spdk_nvmf_rdma_qpair)	qpairs_pending_recv;
 
-	STAILQ_HEAD(, spdk_nvmf_rdma_qpair)	qpairs_pending_send;
+	STAILQ_HEAD(, spdk_nvmf_rdma_sq)	qpairs_pending_send;
 
 	TAILQ_ENTRY(spdk_nvmf_rdma_poller)	link;
 };
@@ -450,6 +519,8 @@ struct spdk_nvmf_rdma_poll_group_stat {
 
 struct spdk_nvmf_rdma_poll_group {
 	struct spdk_nvmf_transport_poll_group		group;
+	/* Position in spdk_nvmf_rdma_transport.xrc_pgs (XRC worker index). */
+	uint32_t					xrc_index;
 	struct spdk_nvmf_rdma_poll_group_stat		stat;
 	struct spdk_io_channel				*accel_ch;
 	/* Requests that are waiting for accel task */
@@ -476,6 +547,13 @@ struct spdk_nvmf_rdma_device {
 	bool					ready_to_destroy;
 	bool					is_ready;
 
+	/* XRC: domain, live XRC queues by TGT QPN, sessions. Guarded by xrc_lock,
+	 * which only the control path and shadow creation take. */
+	struct ibv_xrcd				*xrcd;
+	pthread_mutex_t				xrc_lock;
+	RB_HEAD(xrc_tgt_tree, spdk_nvmf_rdma_xrc_qpair) xrc_tgts;
+	TAILQ_HEAD(, spdk_nvmf_rdma_xrc_session) xrc_sessions;
+
 	TAILQ_ENTRY(spdk_nvmf_rdma_device)	link;
 };
 
@@ -493,6 +571,12 @@ struct rdma_transport_opts {
 	bool		no_wr_batching;
 	bool		in_capsule_data_disabled;
 	int		acceptor_backlog;
+	/* XRC: I/O queues of XRC hosts use XRC; see nvmf_rdma_xrc.h. */
+	bool		xrc;
+	/* XRC: depth of each poll group's command SRQ. */
+	uint32_t	xrc_srq_depth;
+	/* XRC: send queue depth of each INI QP (poll group, host). */
+	uint32_t	xrc_ini_send_depth;
 };
 
 struct spdk_nvmf_rdma_transport {
@@ -517,6 +601,10 @@ struct spdk_nvmf_rdma_transport {
 
 	/* ports that are removed unexpectedly and need retry listen */
 	TAILQ_HEAD(, spdk_nvmf_rdma_port)		retry_ports;
+
+	/* XRC: poll groups by worker index. */
+	struct spdk_nvmf_rdma_poll_group	*xrc_pgs[SPDK_NVMF_RDMA_XRC_MAX_WORKERS];
+	uint32_t				xrc_num_pgs;
 };
 
 struct poller_manage_ctx {
@@ -550,6 +638,18 @@ static const struct spdk_json_object_decoder rdma_transport_opts_decoder[] = {
 		"acceptor_backlog", offsetof(struct rdma_transport_opts, acceptor_backlog),
 		spdk_json_decode_int32, true
 	},
+	{
+		"xrc", offsetof(struct rdma_transport_opts, xrc),
+		spdk_json_decode_bool, true
+	},
+	{
+		"xrc_srq_depth", offsetof(struct rdma_transport_opts, xrc_srq_depth),
+		spdk_json_decode_uint32, true
+	},
+	{
+		"xrc_ini_send_depth", offsetof(struct rdma_transport_opts, xrc_ini_send_depth),
+		spdk_json_decode_uint32, true
+	},
 };
 
 static int
@@ -559,6 +659,1066 @@ nvmf_rdma_qpair_compare(struct spdk_nvmf_rdma_qpair *rqpair1, struct spdk_nvmf_r
 }
 
 RB_GENERATE_STATIC(qpairs_tree, spdk_nvmf_rdma_qpair, node, nvmf_rdma_qpair_compare);
+
+static void nvmf_rdma_qpair_disconnect(struct spdk_nvmf_rdma_qpair *rqpair);
+
+/*
+ * ---------------------------------------------------------------------------
+ * NVMe-oF/RDMA over XRC (transport option "xrc"). Wire format and topology:
+ * include/spdk_internal/nvmf_rdma_xrc.h.
+ *
+ * A host I/O queue is one XRC TGT QP here, with no receive queue: each command
+ * lands in the XRC SRQ of whichever poll group the host named, and that poll
+ * group runs it. The queue keeps its "real" spdk_nvmf_rdma_qpair on the poll
+ * group SPDK picked at connect time (its home): the generic layer only knows
+ * this one (Connect, controller, disconnect). Every other poll group that
+ * receives a command of the queue gets a shadow qpair, created on first use on
+ * that poll group's thread, holding what must stay thread-local: the group
+ * (bdev channels, pause counters), the outstanding list and counters. Data and
+ * response go out on the INI QP of (poll group, host session), so they share
+ * one QP and the RDMA WRITE-before-SEND ordering holds.
+ * ---------------------------------------------------------------------------
+ */
+
+enum nvmf_rdma_xrc_session_state {
+	NVMF_RDMA_XRC_SESSION_CREATED,
+	NVMF_RDMA_XRC_SESSION_CONNECTED,
+	NVMF_RDMA_XRC_SESSION_FAILED,
+};
+
+/* One XRC INI QP: poll group -> one host session. Owned by its poller's thread. */
+struct spdk_nvmf_rdma_xrc_ini {
+	struct ibv_qp				*qp;
+	struct spdk_rdma_provider_qp		rdma_qp;
+	struct spdk_nvmf_rdma_sq		sq;
+	struct spdk_nvmf_rdma_poller		*poller;
+	struct spdk_nvmf_rdma_xrc_session	*session;
+	uint32_t				index;
+	uint32_t				host_tgt_qpn;
+	bool					in_error;
+};
+
+struct spdk_nvmf_rdma_xrc_session {
+	uint64_t				id;
+	struct spdk_nvmf_rdma_device		*device;
+	struct spdk_nvmf_rdma_transport		*rtransport;
+	/* Real qpairs referencing the session. Guarded by device->xrc_lock. */
+	uint32_t				refcnt;
+	/* INI QPs not yet destroyed by their owner thread. */
+	uint32_t				ini_alive;
+	enum nvmf_rdma_xrc_session_state	state;
+	struct spdk_uuid			hostid;
+	char					hostnqn[SPDK_NVMF_NQN_MAX_LEN + 1];
+	/* Path to the host, from the CM REQ of the session's first queue. */
+	struct ibv_qp_attr			rtr;
+	struct ibv_qp_attr			rts;
+	uint8_t					port_num;
+	uint16_t				max_read_depth;
+	uint32_t				num_ini;
+	struct spdk_nvmf_rdma_xrc_ini		ini[SPDK_NVMF_RDMA_XRC_MAX_WORKERS];
+	TAILQ_ENTRY(spdk_nvmf_rdma_xrc_session)	link;
+};
+
+/* XRC part of an spdk_nvmf_rdma_qpair, real or shadow. */
+struct spdk_nvmf_rdma_xrc_qpair {
+	struct spdk_nvmf_rdma_xrc_session	*session;
+	struct spdk_nvmf_rdma_qpair		*rqpair;
+	/* The queue's real qpair (== rqpair unless this is a shadow). */
+	struct spdk_nvmf_rdma_qpair		*real;
+	bool					is_shadow;
+	bool					destroy_scheduled;
+	uint32_t				tgt_qpn;
+	uint32_t				resp_srqn;
+	/* Index of the poll group this qpair lives on. */
+	uint32_t				worker;
+	/* Commands this (queue, poll group) received. */
+	uint64_t				cmds;
+
+	/* Real qpair only. */
+	struct ibv_qp				*tgt_qp;
+	struct spdk_thread			*home_thread;
+	/* qpair_fini callback, held back until the shadows have drained: they
+	 * still use the controller, which the generic layer may free once the
+	 * real qpair is finalized. */
+	spdk_nvmf_transport_qpair_fini_cb	fini_cb;
+	void					*fini_cb_arg;
+	/* Below guarded by device->xrc_lock. */
+	bool					closing;
+	bool					in_tree;
+	uint32_t				num_shadows;
+	struct spdk_nvmf_rdma_qpair		*shadows[SPDK_NVMF_RDMA_XRC_MAX_WORKERS];
+	uint64_t				cmds_per_worker[SPDK_NVMF_RDMA_XRC_MAX_WORKERS];
+	RB_ENTRY(spdk_nvmf_rdma_xrc_qpair)	tgt_node;
+};
+
+static int
+nvmf_rdma_xrc_tgt_compare(struct spdk_nvmf_rdma_xrc_qpair *a, struct spdk_nvmf_rdma_xrc_qpair *b)
+{
+	return a->tgt_qpn < b->tgt_qpn ? -1 : a->tgt_qpn > b->tgt_qpn;
+}
+
+RB_GENERATE_STATIC(xrc_tgt_tree, spdk_nvmf_rdma_xrc_qpair, tgt_node, nvmf_rdma_xrc_tgt_compare);
+
+static void nvmf_rdma_qpair_process_pending(struct spdk_nvmf_rdma_transport *rtransport,
+		struct spdk_nvmf_rdma_qpair *rqpair, bool drain);
+static bool nvmf_rdma_request_process(struct spdk_nvmf_rdma_transport *rtransport,
+				      struct spdk_nvmf_rdma_request *rdma_req);
+static void nvmf_rdma_destroy_drained_qpair(struct spdk_nvmf_rdma_qpair *rqpair);
+static struct spdk_nvmf_rdma_resources *nvmf_rdma_resources_create(
+	struct spdk_nvmf_rdma_resource_opts *opts);
+static int _nvmf_rdma_qpair_abort_request(void *ctx);
+static int nvmf_rdma_request_free(struct spdk_nvmf_request *req);
+
+static inline bool
+nvmf_rdma_is_xrc_shadow(struct spdk_nvmf_rdma_qpair *rqpair)
+{
+	return rqpair->xrc != NULL && rqpair->xrc->is_shadow;
+}
+
+/* Number of request objects a qpair's requests may come from. */
+static inline uint32_t
+nvmf_rdma_qpair_max_reqs(struct spdk_nvmf_rdma_qpair *rqpair)
+{
+	if (rqpair->xrc != NULL) {
+		return rqpair->poller->max_xrc_srq_depth;
+	}
+	return rqpair->srq == NULL ? rqpair->max_queue_depth : rqpair->poller->max_srq_depth;
+}
+
+/* Every WR on an INI QP names the host poller SRQ of the request's queue:
+ * the host NIC checks a READ/WRITE rkey against that SRQ's PD. */
+static inline void
+nvmf_rdma_xrc_stamp(struct spdk_nvmf_rdma_qpair *rqpair, struct ibv_send_wr *wr)
+{
+	if (rqpair->xrc == NULL) {
+		return;
+	}
+	for (; wr != NULL; wr = wr->next) {
+		wr->qp_type.xrc.remote_srqn = rqpair->xrc->resp_srqn;
+	}
+}
+
+static struct spdk_nvmf_rdma_poller *
+nvmf_rdma_rgroup_poller(struct spdk_nvmf_rdma_poll_group *rgroup,
+			struct spdk_nvmf_rdma_device *device)
+{
+	struct spdk_nvmf_rdma_poller *poller;
+
+	TAILQ_FOREACH(poller, &rgroup->pollers, link) {
+		if (poller->device == device) {
+			return poller;
+		}
+	}
+	return NULL;
+}
+
+static int
+nvmf_rdma_xrc_ini_create(struct spdk_nvmf_rdma_xrc_session *session, uint32_t index,
+			 struct spdk_nvmf_rdma_poller *poller)
+{
+	struct spdk_nvmf_rdma_transport *rtransport = session->rtransport;
+	struct spdk_nvmf_rdma_device *device = session->device;
+	struct spdk_nvmf_rdma_xrc_ini *ini = &session->ini[index];
+	struct ibv_qp_init_attr_ex attr = {};
+	struct ibv_qp_attr mod = {};
+
+	attr.qp_type = IBV_QPT_XRC_SEND;
+	attr.comp_mask = IBV_QP_INIT_ATTR_PD;
+	attr.pd = device->pd;
+	attr.send_cq = poller->cq->cq;
+	attr.recv_cq = poller->cq->cq;
+	attr.qp_context = NULL;
+	attr.cap.max_send_wr = spdk_min(rtransport->rdma_opts.xrc_ini_send_depth,
+					(uint32_t)device->attr.max_qp_wr);
+	attr.cap.max_send_sge = spdk_min((uint32_t)device->attr.max_sge, NVMF_DEFAULT_TX_SGE);
+
+	ini->qp = ibv_create_qp_ex(device->context, &attr);
+	if (ini->qp == NULL) {
+		SPDK_ERRLOG("XRC: ibv_create_qp_ex(INI) failed: %s\n", spdk_strerror(errno));
+		return -1;
+	}
+
+	mod.qp_state = IBV_QPS_INIT;
+	mod.pkey_index = session->rtr.pkey_index;
+	mod.port_num = session->port_num;
+	mod.qp_access_flags = 0;
+	if (ibv_modify_qp(ini->qp, &mod, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
+			  IBV_QP_ACCESS_FLAGS)) {
+		SPDK_ERRLOG("XRC: INI QP 0x%x -> INIT failed: %s\n", ini->qp->qp_num, spdk_strerror(errno));
+		ibv_destroy_qp(ini->qp);
+		ini->qp = NULL;
+		return -1;
+	}
+
+	ini->rdma_qp.qp = ini->qp;
+	ini->rdma_qp.stats = &poller->stat.qp_stats;
+	ini->rdma_qp.shared_stats = true;
+	ini->poller = poller;
+	ini->session = session;
+	ini->index = index;
+	ini->sq.rdma_qp = &ini->rdma_qp;
+	ini->sq.max_send_depth = attr.cap.max_send_wr;
+	ini->sq.max_read_depth = session->max_read_depth;
+	ini->sq.xrc_ini = ini;
+	STAILQ_INIT(&ini->sq.pending_rdma_read_queue);
+	STAILQ_INIT(&ini->sq.pending_rdma_write_queue);
+	STAILQ_INIT(&ini->sq.pending_rdma_send_queue);
+	return 0;
+}
+
+/* Connect INI QP -> host TGT QP. Called once per session, under xrc_lock. */
+static int
+nvmf_rdma_xrc_ini_connect(struct spdk_nvmf_rdma_xrc_ini *ini, uint32_t host_tgt_qpn)
+{
+	struct spdk_nvmf_rdma_xrc_session *session = ini->session;
+	struct ibv_qp_attr a = {};
+
+	a.qp_state = IBV_QPS_RTR;
+	a.ah_attr = session->rtr.ah_attr;
+	a.path_mtu = session->rtr.path_mtu;
+	a.dest_qp_num = host_tgt_qpn;
+	/* The INI QP receives nothing but ACKs and READ responses. */
+	a.rq_psn = 0;
+	if (ibv_modify_qp(ini->qp, &a, IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+			  IBV_QP_DEST_QPN | IBV_QP_RQ_PSN)) {
+		SPDK_ERRLOG("XRC: INI QP 0x%x -> RTR (host TGT 0x%x) failed: %s\n",
+			    ini->qp->qp_num, host_tgt_qpn, spdk_strerror(errno));
+		return -1;
+	}
+
+	memset(&a, 0, sizeof(a));
+	a.qp_state = IBV_QPS_RTS;
+	a.timeout = session->rts.timeout;
+	a.retry_cnt = session->rts.retry_cnt;
+	/* The host SRQ may run dry: retry RNR forever, as RC does (rnr_retry 7). */
+	a.rnr_retry = 7;
+	a.sq_psn = spdk_nvmf_rdma_xrc_psn(ini->qp->qp_num);
+	a.max_rd_atomic = session->max_read_depth;
+	if (ibv_modify_qp(ini->qp, &a, IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+			  IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC)) {
+		SPDK_ERRLOG("XRC: INI QP 0x%x -> RTS failed: %s\n", ini->qp->qp_num, spdk_strerror(errno));
+		return -1;
+	}
+	ini->host_tgt_qpn = host_tgt_qpn;
+	return 0;
+}
+
+static void
+nvmf_rdma_xrc_session_free(struct spdk_nvmf_rdma_xrc_session *session)
+{
+	SPDK_NOTICELOG("XRC: session 0x%" PRIx64 " (%s) destroyed\n", session->id, session->hostnqn);
+	free(session);
+}
+
+/* On the INI QP's owner thread. */
+static void
+nvmf_rdma_xrc_ini_destroy(struct spdk_nvmf_rdma_xrc_ini *ini)
+{
+	struct spdk_nvmf_rdma_xrc_session *session = ini->session;
+	struct spdk_nvmf_rdma_sq *sq = &ini->sq, *tmp;
+	bool last;
+
+	if (ini->qp == NULL) {
+		goto out;
+	}
+	/* Drop it from the poller's batch list before the QP goes away. */
+	if (ini->poller != NULL) {
+		STAILQ_FOREACH(tmp, &ini->poller->qpairs_pending_send, send_link) {
+			if (tmp == sq) {
+				struct ibv_send_wr *bad_wr = NULL;
+
+				spdk_rdma_provider_qp_flush_send_wrs(sq->rdma_qp, &bad_wr);
+				STAILQ_REMOVE(&ini->poller->qpairs_pending_send, sq, spdk_nvmf_rdma_sq, send_link);
+				break;
+			}
+		}
+	}
+	if (sq->current_send_depth != 0 || sq->current_read_depth != 0 ||
+	    !STAILQ_EMPTY(&sq->pending_rdma_read_queue) || !STAILQ_EMPTY(&sq->pending_rdma_write_queue) ||
+	    !STAILQ_EMPTY(&sq->pending_rdma_send_queue)) {
+		SPDK_ERRLOG("XRC: INI QP 0x%x (worker %u, session 0x%" PRIx64 ") destroyed with residue: "
+			    "send_depth %u read_depth %u pending read/write/send %d/%d/%d\n",
+			    ini->qp->qp_num, ini->index, session->id, sq->current_send_depth,
+			    sq->current_read_depth, !STAILQ_EMPTY(&sq->pending_rdma_read_queue),
+			    !STAILQ_EMPTY(&sq->pending_rdma_write_queue),
+			    !STAILQ_EMPTY(&sq->pending_rdma_send_queue));
+	}
+	SPDK_NOTICELOG("XRC: INI QP 0x%x worker %u session 0x%" PRIx64 " destroyed: send_depth %u "
+		       "read_depth %u, peak pending READ queue %u, READ stalls %" PRIu64 "\n",
+		       ini->qp->qp_num, ini->index, session->id, sq->current_send_depth,
+		       sq->current_read_depth, sq->pending_read_peak, sq->read_stalls);
+	if (ibv_destroy_qp(ini->qp)) {
+		SPDK_ERRLOG("XRC: ibv_destroy_qp(INI) failed: %s\n", spdk_strerror(errno));
+	}
+	ini->qp = NULL;
+out:
+	last = __atomic_sub_fetch(&session->ini_alive, 1, __ATOMIC_SEQ_CST) == 0;
+	if (last) {
+		nvmf_rdma_xrc_session_free(session);
+	}
+}
+
+static void
+_nvmf_rdma_xrc_ini_destroy(void *ctx)
+{
+	nvmf_rdma_xrc_ini_destroy(ctx);
+}
+
+/* Drop a real qpair's reference. The last one tears the INI QPs down, each on
+ * its owner thread (they share that thread's CQ and batch list). */
+static void
+nvmf_rdma_xrc_session_put(struct spdk_nvmf_rdma_xrc_session *session)
+{
+	struct spdk_nvmf_rdma_device *device = session->device;
+	struct spdk_nvmf_rdma_xrc_ini *ini;
+	struct spdk_thread *thread;
+	uint32_t i, n;
+
+	pthread_mutex_lock(&device->xrc_lock);
+	assert(session->refcnt > 0);
+	if (--session->refcnt > 0) {
+		pthread_mutex_unlock(&device->xrc_lock);
+		return;
+	}
+	TAILQ_REMOVE(&device->xrc_sessions, session, link);
+	n = session->num_ini;
+	pthread_mutex_unlock(&device->xrc_lock);
+
+	for (i = 0; i < n; i++) {
+		ini = &session->ini[i];
+		if (ini->poller == NULL || ini->qp == NULL) {
+			nvmf_rdma_xrc_ini_destroy(ini);
+			continue;
+		}
+		thread = ini->poller->group->group.group->thread;
+		if (thread == spdk_get_thread()) {
+			nvmf_rdma_xrc_ini_destroy(ini);
+		} else {
+			spdk_thread_send_msg(thread, _nvmf_rdma_xrc_ini_destroy, ini);
+		}
+	}
+}
+
+/*
+ * CM REQ of an XRC I/O queue, on the acceptor thread: find the host session
+ * or create it with one INI QP per poll group (not connected yet).
+ */
+static struct spdk_nvmf_rdma_xrc_session *
+nvmf_rdma_xrc_session_get(struct spdk_nvmf_rdma_transport *rtransport,
+			  struct spdk_nvmf_rdma_device *device, struct rdma_cm_event *event,
+			  uint64_t session_id)
+{
+	struct spdk_nvmf_rdma_xrc_session *session;
+	struct spdk_nvmf_rdma_poller *poller;
+	int mask = 0;
+	uint32_t i;
+
+	pthread_mutex_lock(&device->xrc_lock);
+	TAILQ_FOREACH(session, &device->xrc_sessions, link) {
+		if (session->id == session_id) {
+			if (session->state == NVMF_RDMA_XRC_SESSION_FAILED) {
+				session = NULL;
+			} else {
+				session->refcnt++;
+			}
+			pthread_mutex_unlock(&device->xrc_lock);
+			return session;
+		}
+	}
+
+	session = calloc(1, sizeof(*session));
+	if (session == NULL) {
+		pthread_mutex_unlock(&device->xrc_lock);
+		return NULL;
+	}
+	session->id = session_id;
+	session->device = device;
+	session->rtransport = rtransport;
+	session->refcnt = 1;
+	session->state = NVMF_RDMA_XRC_SESSION_CREATED;
+	session->port_num = event->id->port_num;
+	session->max_read_depth = spdk_min((uint32_t)device->attr.max_qp_init_rd_atom,
+					   (uint32_t)event->param.conn.initiator_depth);
+
+	session->rtr.qp_state = IBV_QPS_RTR;
+	if (rdma_init_qp_attr(event->id, &session->rtr, &mask)) {
+		SPDK_ERRLOG("XRC: rdma_init_qp_attr(RTR) failed: %s\n", spdk_strerror(errno));
+		goto fail;
+	}
+	session->rts.qp_state = IBV_QPS_RTS;
+	if (rdma_init_qp_attr(event->id, &session->rts, &mask)) {
+		SPDK_ERRLOG("XRC: rdma_init_qp_attr(RTS) failed: %s\n", spdk_strerror(errno));
+		goto fail;
+	}
+
+	for (i = 0; i < rtransport->xrc_num_pgs; i++) {
+		poller = nvmf_rdma_rgroup_poller(rtransport->xrc_pgs[i], device);
+		if (poller == NULL || poller->xrc_srq == NULL) {
+			SPDK_ERRLOG("XRC: poll group %u has no XRC poller on %s\n", i,
+				    ibv_get_device_name(device->context->device));
+			goto fail;
+		}
+		if (nvmf_rdma_xrc_ini_create(session, i, poller)) {
+			goto fail;
+		}
+		session->num_ini++;
+	}
+	session->ini_alive = session->num_ini;
+
+	TAILQ_INSERT_TAIL(&device->xrc_sessions, session, link);
+	pthread_mutex_unlock(&device->xrc_lock);
+	SPDK_NOTICELOG("XRC: session 0x%" PRIx64 " created on %s: %u INI QPs, READ depth %u\n",
+		       session_id, ibv_get_device_name(device->context->device), session->num_ini,
+		       session->max_read_depth);
+	return session;
+fail:
+	for (i = 0; i < session->num_ini; i++) {
+		ibv_destroy_qp(session->ini[i].qp);
+	}
+	pthread_mutex_unlock(&device->xrc_lock);
+	free(session);
+	return NULL;
+}
+
+/*
+ * First Fabrics Connect of a session, on the queue's home thread: connect
+ * every INI QP to the host's TGT QP for that poll group. Later Connects only
+ * check that the queue belongs to the same host.
+ */
+static int
+nvmf_rdma_xrc_session_connect(struct spdk_nvmf_rdma_qpair *rqpair,
+			      struct spdk_nvmf_rdma_request *rdma_req)
+{
+	struct spdk_nvmf_rdma_xrc_session *session = rqpair->xrc->session;
+	struct spdk_nvmf_rdma_device *device = session->device;
+	struct spdk_nvme_sgl_descriptor *sgl = &rdma_req->req.cmd->nvme_cmd.dptr.sgl1;
+	struct spdk_nvmf_fabric_connect_data *data;
+	struct spdk_nvmf_rdma_xrc_connect_ext ext;
+	char hostnqn[SPDK_NVMF_NQN_MAX_LEN + 1];
+	int rc = 0;
+	uint32_t i;
+
+	if (sgl->generic.type != SPDK_NVME_SGL_TYPE_DATA_BLOCK ||
+	    sgl->unkeyed.subtype != SPDK_NVME_SGL_SUBTYPE_OFFSET ||
+	    sgl->unkeyed.length < sizeof(*data) ||
+	    sgl->address + sizeof(*data) > rqpair->qpair.transport->opts.in_capsule_data_size) {
+		SPDK_ERRLOG("XRC: Fabrics Connect data must be in the capsule (SGL type %u subtype %u "
+			    "addr 0x%" PRIx64 " len %u)\n", sgl->generic.type, sgl->unkeyed.subtype,
+			    sgl->address, sgl->unkeyed.length);
+		return -EINVAL;
+	}
+	data = (struct spdk_nvmf_fabric_connect_data *)(rdma_req->recv->buf + sgl->address);
+	memcpy(&ext, (uint8_t *)data + SPDK_NVMF_RDMA_XRC_CONNECT_EXT_OFFSET, sizeof(ext));
+	snprintf(hostnqn, sizeof(hostnqn), "%.*s", SPDK_NVMF_NQN_MAX_LEN, (char *)data->hostnqn);
+
+	if (ext.xrc_magic != SPDK_NVMF_RDMA_XRC_MAGIC || ext.session_id != session->id ||
+	    ext.num_tgt != session->num_ini) {
+		SPDK_ERRLOG("XRC: bad Connect extension (magic 0x%x session 0x%" PRIx64 " num_tgt %u, "
+			    "expected session 0x%" PRIx64 " num_tgt %u)\n", ext.xrc_magic, ext.session_id,
+			    ext.num_tgt, session->id, session->num_ini);
+		return -EINVAL;
+	}
+
+	pthread_mutex_lock(&device->xrc_lock);
+	switch (session->state) {
+	case NVMF_RDMA_XRC_SESSION_CREATED:
+		for (i = 0; i < session->num_ini; i++) {
+			if (nvmf_rdma_xrc_ini_connect(&session->ini[i], ext.tgt_qpn[i])) {
+				rc = -EIO;
+				break;
+			}
+		}
+		if (rc) {
+			session->state = NVMF_RDMA_XRC_SESSION_FAILED;
+			break;
+		}
+		memcpy(&session->hostid, data->hostid, sizeof(session->hostid));
+		snprintf(session->hostnqn, sizeof(session->hostnqn), "%s", hostnqn);
+		session->state = NVMF_RDMA_XRC_SESSION_CONNECTED;
+		SPDK_NOTICELOG("XRC: session 0x%" PRIx64 " connected for host %s\n", session->id, hostnqn);
+		break;
+	case NVMF_RDMA_XRC_SESSION_CONNECTED:
+		if (strcmp(session->hostnqn, hostnqn) != 0 ||
+		    memcmp(&session->hostid, data->hostid, sizeof(session->hostid)) != 0) {
+			SPDK_ERRLOG("XRC: queue of session 0x%" PRIx64 " connects as %s, session is %s\n",
+				    session->id, hostnqn, session->hostnqn);
+			rc = -EPERM;
+			break;
+		}
+		for (i = 0; i < session->num_ini; i++) {
+			if (session->ini[i].host_tgt_qpn != ext.tgt_qpn[i]) {
+				SPDK_ERRLOG("XRC: session 0x%" PRIx64 " host TGT QPN %u changed\n", session->id, i);
+				rc = -EINVAL;
+				break;
+			}
+		}
+		break;
+	default:
+		rc = -EIO;
+		break;
+	}
+	pthread_mutex_unlock(&device->xrc_lock);
+	return rc;
+}
+
+/* TGT QP of a real qpair, on its home thread before the CM accept. */
+static int
+nvmf_rdma_xrc_tgt_create(struct spdk_nvmf_rdma_qpair *rqpair)
+{
+	struct spdk_nvmf_rdma_device *device = rqpair->device;
+	struct spdk_nvmf_rdma_xrc_qpair *xrc = rqpair->xrc;
+	struct ibv_qp_init_attr_ex attr = {};
+	struct ibv_qp_attr cm = {}, a = {};
+	int mask = 0;
+
+	attr.qp_type = IBV_QPT_XRC_RECV;
+	attr.comp_mask = IBV_QP_INIT_ATTR_XRCD;
+	attr.xrcd = device->xrcd;
+	xrc->tgt_qp = ibv_create_qp_ex(device->context, &attr);
+	if (xrc->tgt_qp == NULL) {
+		SPDK_ERRLOG("XRC: ibv_create_qp_ex(TGT) failed: %s\n", spdk_strerror(errno));
+		return -1;
+	}
+
+	a.qp_state = IBV_QPS_INIT;
+	a.pkey_index = xrc->session->rtr.pkey_index;
+	a.port_num = rqpair->cm_id->port_num;
+	a.qp_access_flags = 0;
+	if (ibv_modify_qp(xrc->tgt_qp, &a, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
+			  IBV_QP_ACCESS_FLAGS)) {
+		SPDK_ERRLOG("XRC: TGT QP -> INIT failed: %s\n", spdk_strerror(errno));
+		goto fail;
+	}
+
+	cm.qp_state = IBV_QPS_RTR;
+	if (rdma_init_qp_attr(rqpair->cm_id, &cm, &mask)) {
+		SPDK_ERRLOG("XRC: rdma_init_qp_attr(RTR) failed: %s\n", spdk_strerror(errno));
+		goto fail;
+	}
+	memset(&a, 0, sizeof(a));
+	a.qp_state = IBV_QPS_RTR;
+	a.ah_attr = cm.ah_attr;
+	a.path_mtu = cm.path_mtu;
+	a.dest_qp_num = cm.dest_qp_num;
+	a.rq_psn = cm.rq_psn;
+	/* The host never RDMA-READs the target. */
+	a.max_dest_rd_atomic = 0;
+	a.min_rnr_timer = cm.min_rnr_timer;
+	if (ibv_modify_qp(xrc->tgt_qp, &a, IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+			  IBV_QP_DEST_QPN | IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC |
+			  IBV_QP_MIN_RNR_TIMER)) {
+		SPDK_ERRLOG("XRC: TGT QP 0x%x -> RTR failed: %s\n", xrc->tgt_qp->qp_num, spdk_strerror(errno));
+		goto fail;
+	}
+	xrc->tgt_qpn = xrc->tgt_qp->qp_num;
+	return 0;
+fail:
+	ibv_destroy_qp(xrc->tgt_qp);
+	xrc->tgt_qp = NULL;
+	return -1;
+}
+
+static int
+nvmf_rdma_xrc_accept(struct spdk_nvmf_rdma_qpair *rqpair)
+{
+	struct spdk_nvmf_rdma_xrc_qpair *xrc = rqpair->xrc;
+	struct spdk_nvmf_rdma_xrc_session *session = xrc->session;
+	uint8_t buf[sizeof(struct spdk_nvmf_rdma_xrc_accept_private_data) +
+					   2 * sizeof(uint32_t) * SPDK_NVMF_RDMA_XRC_MAX_WORKERS] = {};
+	struct spdk_nvmf_rdma_xrc_accept_private_data *pd = (void *)buf;
+	struct spdk_nvmf_rdma_transport *rtransport = session->rtransport;
+	struct spdk_nvmf_rdma_poller *poller;
+	struct rdma_conn_param param = {};
+	uint32_t i, n = session->num_ini;
+	int rc;
+
+	pd->recfmt = 0;
+	pd->crqsize = rqpair->max_queue_depth;
+	pd->xrc_magic = SPDK_NVMF_RDMA_XRC_MAGIC;
+	pd->xrc_version = SPDK_NVMF_RDMA_XRC_VERSION;
+	pd->num_workers = n;
+	pd->home = xrc->worker;
+	pd->tgt_qpn = xrc->tgt_qpn;
+	for (i = 0; i < n; i++) {
+		poller = nvmf_rdma_rgroup_poller(rtransport->xrc_pgs[i], rqpair->device);
+		assert(poller != NULL);
+		pd->data[i] = poller->xrc_srqn;
+		pd->data[n + i] = session->ini[i].qp->qp_num;
+	}
+
+	param.private_data = pd;
+	param.private_data_len = sizeof(*pd) + 2 * sizeof(uint32_t) * n;
+	param.responder_resources = 0;
+	param.initiator_depth = session->max_read_depth;
+	param.rnr_retry_count = 0x7;
+	param.srq = 1;
+	param.qp_num = xrc->tgt_qpn;
+
+	rc = rdma_accept(rqpair->cm_id, &param);
+	if (rc) {
+		SPDK_ERRLOG("XRC: rdma_accept failed: %s\n", spdk_strerror(errno));
+	}
+	return rc;
+}
+
+/* Worker of the poller a qpair lives on. */
+static inline uint32_t
+nvmf_rdma_poller_worker(struct spdk_nvmf_rdma_poller *rpoller)
+{
+	return rpoller->group->xrc_index;
+}
+
+/*
+ * A command for TGT QP qp_num arrived on a poll group that has no qpair for it
+ * yet: create the queue's shadow here, on this thread. NULL if the queue is
+ * gone or closing (the command is then dropped and its buffer reposted).
+ */
+static struct spdk_nvmf_rdma_qpair *
+nvmf_rdma_xrc_shadow_get(struct spdk_nvmf_rdma_poller *rpoller, uint32_t qp_num)
+{
+	struct spdk_nvmf_rdma_device *device = rpoller->device;
+	struct spdk_nvmf_rdma_xrc_qpair find = {}, *real_xrc;
+	struct spdk_nvmf_rdma_qpair *real, *shadow = NULL;
+	struct spdk_nvmf_rdma_xrc_ini *ini;
+	uint32_t w = nvmf_rdma_poller_worker(rpoller);
+
+	find.tgt_qpn = qp_num;
+	pthread_mutex_lock(&device->xrc_lock);
+	real_xrc = RB_FIND(xrc_tgt_tree, &device->xrc_tgts, &find);
+	if (real_xrc == NULL || real_xrc->closing || real_xrc->shadows[w] != NULL) {
+		goto out;
+	}
+	real = real_xrc->rqpair;
+	if (real->qpair.state != SPDK_NVMF_QPAIR_ENABLED || real->qpair.ctrlr == NULL ||
+	    real_xrc->session->state != NVMF_RDMA_XRC_SESSION_CONNECTED) {
+		goto out;
+	}
+
+	shadow = calloc(1, sizeof(*shadow));
+	if (shadow == NULL) {
+		goto out;
+	}
+	shadow->xrc = calloc(1, sizeof(*shadow->xrc));
+	if (shadow->xrc == NULL) {
+		free(shadow);
+		shadow = NULL;
+		goto out;
+	}
+	shadow->xrc->rqpair = shadow;
+	shadow->xrc->real = real;
+	shadow->xrc->is_shadow = true;
+	shadow->xrc->session = real_xrc->session;
+	shadow->xrc->tgt_qpn = qp_num;
+	shadow->xrc->resp_srqn = real_xrc->resp_srqn;
+	shadow->xrc->worker = w;
+
+	ini = &real_xrc->session->ini[w];
+	shadow->device = device;
+	shadow->poller = rpoller;
+	shadow->srq = rpoller->xrc_srq;
+	shadow->resources = rpoller->xrc_resources;
+	shadow->qp_num = qp_num;
+	shadow->max_queue_depth = real->max_queue_depth;
+	shadow->max_send_sge = real->max_send_sge;
+	shadow->sq = &ini->sq;
+	shadow->listen_id = real->listen_id;
+	shadow->qpair.transport = real->qpair.transport;
+	shadow->qpair.qid = real->qpair.qid;
+	shadow->qpair.ctrlr = real->qpair.ctrlr;
+	shadow->qpair.group = rpoller->group->group.group;
+	shadow->qpair.numa = real->qpair.numa;
+	shadow->qpair.sq_head_max = real->qpair.sq_head_max;
+	TAILQ_INIT(&shadow->qpair.outstanding);
+	shadow->qpair.state = SPDK_NVMF_QPAIR_ENABLED;
+
+	real_xrc->shadows[w] = shadow;
+	real_xrc->num_shadows++;
+out:
+	pthread_mutex_unlock(&device->xrc_lock);
+	if (shadow != NULL) {
+		RB_INSERT(qpairs_tree, &rpoller->qpairs, shadow);
+		rpoller->stat.xrc_shadows_created++;
+		SPDK_DEBUGLOG(rdma, "XRC: shadow of qid %u (TGT 0x%x) on worker %u\n",
+			      shadow->qpair.qid, qp_num, w);
+	}
+	return shadow;
+}
+
+static void _nvmf_rdma_xrc_shadow_try_destroy(void *ctx);
+
+/* Schedule a destroy attempt on the shadow's thread; never frees inline, since
+ * callers up the stack may still hold the shadow. */
+static void
+nvmf_rdma_xrc_shadow_schedule_destroy(struct spdk_nvmf_rdma_qpair *shadow)
+{
+	if (shadow->xrc->destroy_scheduled) {
+		return;
+	}
+	shadow->xrc->destroy_scheduled = true;
+	spdk_thread_send_msg(shadow->qpair.group->thread, _nvmf_rdma_xrc_shadow_try_destroy, shadow);
+}
+
+static void
+nvmf_rdma_xrc_shadow_state_cb(void *cb_arg, int status)
+{
+	nvmf_rdma_xrc_shadow_schedule_destroy(cb_arg);
+}
+
+static void
+_nvmf_rdma_xrc_real_shadows_gone(void *ctx)
+{
+	struct spdk_nvmf_rdma_qpair *real = ctx;
+	spdk_nvmf_transport_qpair_fini_cb cb = real->xrc->fini_cb;
+
+	if (cb != NULL) {
+		real->xrc->fini_cb = NULL;
+		cb(real->xrc->fini_cb_arg);
+	}
+	nvmf_rdma_destroy_drained_qpair(real);
+}
+
+/* Free a drained shadow. Forced (poller teardown) frees whatever is left. */
+static void
+nvmf_rdma_xrc_shadow_destroy(struct spdk_nvmf_rdma_qpair *shadow)
+{
+	struct spdk_nvmf_rdma_xrc_qpair *xrc = shadow->xrc;
+	struct spdk_nvmf_rdma_qpair *real = xrc->real;
+	struct spdk_nvmf_rdma_device *device = shadow->device;
+	struct spdk_nvmf_rdma_recv *rdma_recv, *recv_tmp;
+	struct spdk_nvmf_rdma_poller *rpoller = shadow->poller;
+	struct ibv_recv_wr *bad_wr = NULL;
+	struct spdk_thread *home;
+	bool notify;
+
+	/* Receives this shadow never got a request for. */
+	STAILQ_FOREACH_SAFE(rdma_recv, &shadow->resources->incoming_queue, link, recv_tmp) {
+		if (rdma_recv->qpair == shadow) {
+			STAILQ_REMOVE(&shadow->resources->incoming_queue, rdma_recv, spdk_nvmf_rdma_recv, link);
+			rdma_recv->wr.next = NULL;
+			spdk_rdma_provider_srq_queue_recv_wrs(rpoller->xrc_srq, &rdma_recv->wr);
+			rpoller->xrc_recvs_held--;
+		}
+	}
+	spdk_rdma_provider_srq_flush_recv_wrs(rpoller->xrc_srq, &bad_wr);
+
+	if (shadow->qd != 0 || !TAILQ_EMPTY(&shadow->qpair.outstanding)) {
+		SPDK_ERRLOG("XRC: shadow of qid %u on worker %u destroyed with qd %u, outstanding %d\n",
+			    shadow->qpair.qid, xrc->worker, shadow->qd,
+			    !TAILQ_EMPTY(&shadow->qpair.outstanding));
+	}
+	RB_REMOVE(qpairs_tree, &rpoller->qpairs, shadow);
+	rpoller->stat.xrc_shadows_destroyed++;
+
+	pthread_mutex_lock(&device->xrc_lock);
+	real->xrc->cmds_per_worker[xrc->worker] += xrc->cmds;
+	assert(real->xrc->shadows[xrc->worker] == shadow);
+	real->xrc->shadows[xrc->worker] = NULL;
+	assert(real->xrc->num_shadows > 0);
+	notify = --real->xrc->num_shadows == 0;
+	home = real->xrc->home_thread;
+	pthread_mutex_unlock(&device->xrc_lock);
+
+	free(xrc);
+	free(shadow);
+
+	if (notify && home != NULL) {
+		/* Messages from one thread arrive in order, so the real qpair cannot be
+		 * gone before this one is handled: it waits for num_shadows == 0. */
+		spdk_thread_send_msg(home, _nvmf_rdma_xrc_real_shadows_gone, real);
+	}
+}
+
+static void
+_nvmf_rdma_xrc_shadow_try_destroy(void *ctx)
+{
+	struct spdk_nvmf_rdma_qpair *shadow = ctx;
+
+	shadow->xrc->destroy_scheduled = false;
+	if (shadow->qpair.state != SPDK_NVMF_QPAIR_DEACTIVATING) {
+		return;
+	}
+	if (shadow->qd != 0 || !TAILQ_EMPTY(&shadow->qpair.outstanding)) {
+		return;
+	}
+	nvmf_rdma_xrc_shadow_destroy(shadow);
+}
+
+/* The real qpair is closing: deactivate the shadow on its own thread and
+ * release whatever of it is still queued. In-flight requests finish as usual
+ * and each completion retries the destroy. */
+static void
+_nvmf_rdma_xrc_shadow_drain(void *ctx)
+{
+	struct spdk_nvmf_rdma_qpair *shadow = ctx;
+	struct spdk_nvmf_rdma_transport *rtransport = SPDK_CONTAINEROF(shadow->qpair.transport,
+			struct spdk_nvmf_rdma_transport, transport);
+	struct spdk_nvmf_rdma_request *rdma_req, *tmp;
+	struct spdk_nvmf_request *req, *req_tmp;
+	struct spdk_nvmf_rdma_sq *sq = shadow->sq;
+	struct spdk_nvmf_poll_group *group = shadow->qpair.group;
+	uint32_t sid;
+
+	shadow->to_close = true;
+	shadow->qpair.state_cb = nvmf_rdma_xrc_shadow_state_cb;
+	shadow->qpair.state_cb_arg = shadow;
+	shadow->qpair.state = SPDK_NVMF_QPAIR_DEACTIVATING;
+
+	/* Queued on the shared INI QP or waiting for a buffer: complete them now. */
+	STAILQ_FOREACH_SAFE(rdma_req, &sq->pending_rdma_send_queue, state_link, tmp) {
+		if (rdma_req->req.qpair == &shadow->qpair) {
+			nvmf_rdma_request_process(rtransport, rdma_req);
+		}
+	}
+	STAILQ_FOREACH_SAFE(rdma_req, &sq->pending_rdma_read_queue, state_link, tmp) {
+		if (rdma_req->req.qpair == &shadow->qpair &&
+		    rdma_req->state == RDMA_REQUEST_STATE_DATA_TRANSFER_TO_CONTROLLER_PENDING) {
+			nvmf_rdma_request_process(rtransport, rdma_req);
+		}
+	}
+	STAILQ_FOREACH_SAFE(rdma_req, &sq->pending_rdma_write_queue, state_link, tmp) {
+		if (rdma_req->req.qpair == &shadow->qpair) {
+			nvmf_rdma_request_process(rtransport, rdma_req);
+		}
+	}
+	STAILQ_FOREACH_SAFE(req, &shadow->poller->group->group.pending_buf_queue, buf_link, req_tmp) {
+		if (req->qpair == &shadow->qpair) {
+			rdma_req = SPDK_CONTAINEROF(req, struct spdk_nvmf_rdma_request, req);
+			nvmf_rdma_request_process(rtransport, rdma_req);
+		}
+	}
+	/* Held back by a paused subsystem or namespace (never started). */
+	for (sid = 0; sid < group->num_sgroups; sid++) {
+		TAILQ_FOREACH_SAFE(req, &group->sgroups[sid].queued, link, req_tmp) {
+			if (req->qpair == &shadow->qpair) {
+				TAILQ_REMOVE(&group->sgroups[sid].queued, req, link);
+				nvmf_rdma_request_free(req);
+			}
+		}
+	}
+	nvmf_rdma_xrc_shadow_schedule_destroy(shadow);
+}
+
+/* Real qpair is being closed (home thread): no new shadows, drain the others.
+ * Returns true if cb_fn is held back until they are gone. */
+static bool
+nvmf_rdma_xrc_real_close(struct spdk_nvmf_rdma_qpair *rqpair,
+			 spdk_nvmf_transport_qpair_fini_cb cb_fn, void *cb_arg)
+{
+	struct spdk_nvmf_rdma_xrc_qpair *xrc = rqpair->xrc;
+	struct spdk_nvmf_rdma_device *device = rqpair->device;
+	struct spdk_nvmf_rdma_qpair *shadows[SPDK_NVMF_RDMA_XRC_MAX_WORKERS];
+	struct ibv_qp_attr a = {};
+	uint32_t i, n = 0;
+
+	if (xrc->tgt_qp != NULL) {
+		/* Stop taking commands for this queue. */
+		a.qp_state = IBV_QPS_ERR;
+		ibv_modify_qp(xrc->tgt_qp, &a, IBV_QP_STATE);
+	}
+
+	pthread_mutex_lock(&device->xrc_lock);
+	if (xrc->closing) {
+		pthread_mutex_unlock(&device->xrc_lock);
+		return false;
+	}
+	xrc->closing = true;
+	for (i = 0; i < SPDK_NVMF_RDMA_XRC_MAX_WORKERS; i++) {
+		if (xrc->shadows[i] != NULL) {
+			shadows[n++] = xrc->shadows[i];
+		}
+	}
+	if (n != 0) {
+		xrc->fini_cb = cb_fn;
+		xrc->fini_cb_arg = cb_arg;
+	}
+	pthread_mutex_unlock(&device->xrc_lock);
+
+	/* A shadow is freed only on its own thread after this message, and a
+	 * shadow cannot appear any more (closing). */
+	for (i = 0; i < n; i++) {
+		spdk_thread_send_msg(shadows[i]->qpair.group->thread, _nvmf_rdma_xrc_shadow_drain, shadows[i]);
+	}
+	return n != 0 && cb_fn != NULL;
+}
+
+static bool
+nvmf_rdma_xrc_real_has_shadows(struct spdk_nvmf_rdma_qpair *rqpair)
+{
+	bool has;
+
+	pthread_mutex_lock(&rqpair->device->xrc_lock);
+	has = rqpair->xrc->num_shadows != 0;
+	pthread_mutex_unlock(&rqpair->device->xrc_lock);
+	return has;
+}
+
+/* Last part of nvmf_rdma_qpair_destroy() for a real XRC qpair. */
+static void
+nvmf_rdma_xrc_real_destroy(struct spdk_nvmf_rdma_qpair *rqpair)
+{
+	struct spdk_nvmf_rdma_xrc_qpair *xrc = rqpair->xrc;
+	struct spdk_nvmf_rdma_device *device = rqpair->device;
+	char dist[SPDK_NVMF_RDMA_XRC_MAX_WORKERS * 22] = "";
+	size_t off = 0;
+	uint32_t i;
+
+	pthread_mutex_lock(&device->xrc_lock);
+	if (xrc->in_tree) {
+		RB_REMOVE(xrc_tgt_tree, &device->xrc_tgts, xrc);
+		xrc->in_tree = false;
+	}
+	xrc->closing = true;
+	xrc->cmds_per_worker[xrc->worker] += xrc->cmds;
+	pthread_mutex_unlock(&device->xrc_lock);
+
+	if (xrc->num_shadows != 0) {
+		SPDK_ERRLOG("XRC: qid %u destroyed with %u shadows left\n", rqpair->qpair.qid,
+			    xrc->num_shadows);
+	}
+	if (xrc->session != NULL) {
+		for (i = 0; i < xrc->session->num_ini && off < sizeof(dist); i++) {
+			off += snprintf(dist + off, sizeof(dist) - off, "%s%" PRIu64, i ? " " : "",
+					xrc->cmds_per_worker[i]);
+		}
+		SPDK_NOTICELOG("XRC: queue qid %u cntlid %u (TGT 0x%x, home %u, session 0x%" PRIx64
+			       ") commands per worker: [%s]\n", rqpair->qpair.qid,
+			       rqpair->qpair.ctrlr ? rqpair->qpair.ctrlr->cntlid : 0, xrc->tgt_qpn, xrc->worker,
+			       xrc->session->id, dist);
+	}
+	if (xrc->tgt_qp != NULL) {
+		if (ibv_destroy_qp(xrc->tgt_qp)) {
+			SPDK_ERRLOG("XRC: ibv_destroy_qp(TGT) failed: %s\n", spdk_strerror(errno));
+		}
+		xrc->tgt_qp = NULL;
+	}
+	if (xrc->session != NULL) {
+		nvmf_rdma_xrc_session_put(xrc->session);
+		xrc->session = NULL;
+	}
+	free(xrc);
+	rqpair->xrc = NULL;
+}
+
+/*
+ * An INI QP failed: every queue of that host with a qpair on this poll group
+ * loses its data/response path here, so all of them disconnect. On this
+ * poller's thread.
+ */
+static void
+nvmf_rdma_xrc_ini_failed(struct spdk_nvmf_rdma_poller *rpoller, struct spdk_nvmf_rdma_sq *sq)
+{
+	struct spdk_nvmf_rdma_xrc_ini *ini = sq->xrc_ini;
+	struct spdk_nvmf_rdma_qpair *rqpair, *tmp;
+	uint32_t n = 0;
+
+	if (ini == NULL || ini->in_error) {
+		return;
+	}
+	ini->in_error = true;
+	RB_FOREACH_SAFE(rqpair, qpairs_tree, &rpoller->qpairs, tmp) {
+		if (rqpair->sq == sq) {
+			rqpair->ibv_in_error_state = true;
+			nvmf_rdma_qpair_disconnect(rqpair);
+			n++;
+		}
+	}
+	SPDK_ERRLOG("XRC: INI QP 0x%x (worker %u, session 0x%" PRIx64 ", host %s) failed: "
+		    "disconnecting the %u queues of that host on this worker\n", ini->qp->qp_num,
+		    ini->index, ini->session->id, ini->session->hostnqn, n);
+}
+
+/* NVMe Abort for a queue whose commands may run on any poll group: visit
+ * the poll groups one after the other until one holds the command. */
+struct nvmf_rdma_xrc_abort_ctx {
+	struct spdk_nvmf_request		*req;
+	struct spdk_nvmf_rdma_qpair		*real;
+	struct spdk_nvmf_rdma_device		*device;
+	struct spdk_nvmf_rdma_transport		*rtransport;
+	uint32_t				tgt_qpn;
+	uint32_t				next;
+};
+
+static void
+_nvmf_rdma_xrc_abort_step(void *arg)
+{
+	struct nvmf_rdma_xrc_abort_ctx *ctx = arg;
+	struct spdk_nvmf_rdma_transport *rtransport = ctx->rtransport;
+	struct spdk_nvmf_request *req = ctx->req;
+	struct spdk_nvmf_rdma_poller *rpoller;
+	struct spdk_nvmf_rdma_qpair find = {}, *rqpair;
+	struct spdk_nvmf_rdma_request *rdma_req;
+	uint16_t cid = req->cmd->nvme_cmd.cdw10_bits.abort.cid;
+	uint32_t i, idx = ctx->next++;
+
+	rpoller = nvmf_rdma_rgroup_poller(rtransport->xrc_pgs[idx], ctx->device);
+	if (rpoller != NULL && rpoller->xrc_resources != NULL) {
+		find.qp_num = ctx->tgt_qpn;
+		rqpair = RB_FIND(qpairs_tree, &rpoller->qpairs, &find);
+		if (rqpair != NULL && rqpair->xrc != NULL && rqpair->xrc->real == ctx->real) {
+			for (i = 0; i < rpoller->max_xrc_srq_depth; i++) {
+				rdma_req = &rpoller->xrc_resources->reqs[i];
+				if (rdma_req->state != RDMA_REQUEST_STATE_FREE &&
+				    rdma_req->req.qpair == &rqpair->qpair &&
+				    rdma_req->req.cmd->nvme_cmd.cid == cid) {
+					SPDK_NOTICELOG("XRC: abort of qid %u cid %u found on worker %u (home %u)\n",
+						       rqpair->qpair.qid, cid, idx, ctx->real->xrc ? ctx->real->xrc->worker : 0);
+					free(ctx);
+					req->req_to_abort = &rdma_req->req;
+					req->timeout_tsc = spdk_get_ticks() +
+							   rtransport->transport.opts.abort_timeout_sec * spdk_get_ticks_hz();
+					req->poller = NULL;
+					_nvmf_rdma_qpair_abort_request(req);
+					return;
+				}
+			}
+		}
+	}
+
+	if (ctx->next < rtransport->xrc_num_pgs) {
+		spdk_thread_send_msg(rtransport->xrc_pgs[ctx->next]->group.group->thread,
+				     _nvmf_rdma_xrc_abort_step, ctx);
+		return;
+	}
+	free(ctx);
+	/* Not found: cdw0 bit 0 stays 1 ("not aborted"). */
+	spdk_nvmf_request_complete(req);
+}
+
+static void
+nvmf_rdma_xrc_abort_request(struct spdk_nvmf_rdma_qpair *rqpair, struct spdk_nvmf_request *req)
+{
+	struct spdk_nvmf_rdma_transport *rtransport = SPDK_CONTAINEROF(rqpair->qpair.transport,
+			struct spdk_nvmf_rdma_transport, transport);
+	struct nvmf_rdma_xrc_abort_ctx *ctx;
+
+	ctx = calloc(1, sizeof(*ctx));
+	if (ctx == NULL || rtransport->xrc_num_pgs == 0) {
+		free(ctx);
+		spdk_nvmf_request_complete(req);
+		return;
+	}
+	ctx->req = req;
+	ctx->real = rqpair;
+	ctx->device = rqpair->device;
+	ctx->rtransport = rtransport;
+	ctx->tgt_qpn = rqpair->xrc->tgt_qpn;
+	ctx->next = 0;
+	spdk_thread_send_msg(rtransport->xrc_pgs[0]->group.group->thread, _nvmf_rdma_xrc_abort_step, ctx);
+}
+
+static void
+nvmf_rdma_qpair_disconnect(struct spdk_nvmf_rdma_qpair *rqpair)
+{
+	if (spdk_likely(rqpair->xrc == NULL)) {
+		spdk_nvmf_qpair_disconnect(&rqpair->qpair);
+		return;
+	}
+	/* A queue's lifecycle belongs to its real qpair; a shadow follows it. */
+	if (rqpair->xrc->is_shadow) {
+		rqpair = rqpair->xrc->real;
+	}
+	spdk_nvmf_qpair_disconnect(&rqpair->qpair);
+}
 
 static bool nvmf_rdma_request_process(struct spdk_nvmf_rdma_transport *rtransport,
 				      struct spdk_nvmf_rdma_request *rdma_req);
@@ -785,6 +1945,7 @@ nvmf_rdma_resources_create(struct spdk_nvmf_rdma_resource_opts *opts)
 
 		rdma_recv->wr.wr_id = (uintptr_t)&rdma_recv->rdma_wr;
 		rdma_recv->wr.sg_list = rdma_recv->sgl;
+		rdma_recv->srq = srq;
 		if (srq) {
 			spdk_rdma_provider_srq_queue_recv_wrs(srq, &rdma_recv->wr);
 		} else {
@@ -891,7 +2052,7 @@ nvmf_rdma_qpair_destroy(struct spdk_nvmf_rdma_qpair *rqpair)
 			nvmf_rdma_dump_qpair_contents(rqpair);
 			max_req_count = rqpair->max_queue_depth;
 		} else if (rqpair->poller && rqpair->resources) {
-			max_req_count = rqpair->poller->max_srq_depth;
+			max_req_count = nvmf_rdma_qpair_max_reqs(rqpair);
 		}
 
 		SPDK_DEBUGLOG(rdma, "Release incomplete requests\n");
@@ -914,6 +2075,10 @@ nvmf_rdma_qpair_destroy(struct spdk_nvmf_rdma_qpair *rqpair)
 			STAILQ_FOREACH_SAFE(rdma_recv, &rqpair->resources->incoming_queue, link, recv_tmp) {
 				if (rqpair == rdma_recv->qpair) {
 					STAILQ_REMOVE(&rqpair->resources->incoming_queue, rdma_recv, spdk_nvmf_rdma_recv, link);
+					if (rqpair->xrc != NULL) {
+						rqpair->poller->xrc_recvs_held--;
+						rdma_recv->wr.next = NULL;
+					}
 					spdk_rdma_provider_srq_queue_recv_wrs(rqpair->srq, &rdma_recv->wr);
 					rc = spdk_rdma_provider_srq_flush_recv_wrs(rqpair->srq, &bad_recv_wr);
 					if (rc) {
@@ -937,6 +2102,10 @@ nvmf_rdma_qpair_destroy(struct spdk_nvmf_rdma_qpair *rqpair)
 
 	if (rqpair->srq == NULL && rqpair->resources != NULL) {
 		nvmf_rdma_resources_destroy(rqpair->resources);
+	}
+
+	if (rqpair->xrc != NULL) {
+		nvmf_rdma_xrc_real_destroy(rqpair);
 	}
 
 	nvmf_rdma_qpair_clean_ibv_events(rqpair);
@@ -1012,6 +2181,31 @@ nvmf_rdma_qpair_initialize(struct spdk_nvmf_qpair *qpair)
 	rqpair = SPDK_CONTAINEROF(qpair, struct spdk_nvmf_rdma_qpair, qpair);
 	device = rqpair->device;
 
+	if (rqpair->xrc != NULL) {
+		struct spdk_nvmf_rdma_xrc_qpair *xrc = rqpair->xrc;
+
+		xrc->worker = rqpair->poller->group->xrc_index;
+		xrc->home_thread = spdk_get_thread();
+		rqpair->srq = rqpair->poller->xrc_srq;
+		if (rqpair->srq == NULL || nvmf_rdma_xrc_tgt_create(rqpair)) {
+			goto error;
+		}
+		rqpair->qp_num = xrc->tgt_qpn;
+		rqpair->resources = rqpair->poller->xrc_resources;
+		rqpair->sq = &xrc->session->ini[xrc->worker].sq;
+		rqpair->max_send_sge = spdk_min((uint32_t)device->attr.max_sge, NVMF_DEFAULT_TX_SGE);
+		rqpair->current_recv_depth = 0;
+		rqpair->qpair.queue_depth = 0;
+
+		pthread_mutex_lock(&device->xrc_lock);
+		RB_INSERT(xrc_tgt_tree, &device->xrc_tgts, xrc);
+		xrc->in_tree = true;
+		pthread_mutex_unlock(&device->xrc_lock);
+		SPDK_DEBUGLOG(rdma, "XRC queue qid %u: TGT QP 0x%x on worker %u\n", rqpair->qpair.qid,
+			      xrc->tgt_qpn, xrc->worker);
+		return 0;
+	}
+
 	qp_init_attr.qp_context	= rqpair;
 	qp_init_attr.pd		= device->pd;
 	qp_init_attr.cq		= rqpair->poller->cq;
@@ -1041,8 +2235,9 @@ nvmf_rdma_qpair_initialize(struct spdk_nvmf_qpair *qpair)
 	}
 
 	rqpair->qp_num = rqpair->rdma_qp->qp->qp_num;
+	rqpair->sq->rdma_qp = rqpair->rdma_qp;
 
-	rqpair->max_send_depth = spdk_min((uint32_t)(rqpair->max_queue_depth * 2),
+	rqpair->sq->max_send_depth = spdk_min((uint32_t)(rqpair->max_queue_depth * 2),
 					  qp_init_attr.cap.max_send_wr);
 	rqpair->max_send_sge = spdk_min(NVMF_DEFAULT_TX_SGE, qp_init_attr.cap.max_send_sge);
 	spdk_trace_record(TRACE_RDMA_QP_CREATE, 0, 0, (uintptr_t)rqpair);
@@ -1071,9 +2266,9 @@ nvmf_rdma_qpair_initialize(struct spdk_nvmf_qpair *qpair)
 	}
 
 	rqpair->current_recv_depth = 0;
-	STAILQ_INIT(&rqpair->pending_rdma_read_queue);
-	STAILQ_INIT(&rqpair->pending_rdma_write_queue);
-	STAILQ_INIT(&rqpair->pending_rdma_send_queue);
+	STAILQ_INIT(&rqpair->sq->pending_rdma_read_queue);
+	STAILQ_INIT(&rqpair->sq->pending_rdma_write_queue);
+	STAILQ_INIT(&rqpair->sq->pending_rdma_send_queue);
 	rqpair->qpair.queue_depth = 0;
 
 	return 0;
@@ -1093,6 +2288,9 @@ nvmf_rdma_qpair_queue_recv_wrs(struct spdk_nvmf_rdma_qpair *rqpair, struct ibv_r
 			struct spdk_nvmf_rdma_transport, transport);
 
 	if (rqpair->srq != NULL) {
+		if (rqpair->xrc != NULL) {
+			rqpair->poller->xrc_recvs_held--;
+		}
 		spdk_rdma_provider_srq_queue_recv_wrs(rqpair->srq, first);
 	} else {
 		if (spdk_rdma_provider_qp_queue_recv_wrs(rqpair->rdma_qp, first)) {
@@ -1122,17 +2320,18 @@ request_transfer_in(struct spdk_nvmf_request *req)
 	assert(req->xfer == SPDK_NVME_DATA_HOST_TO_CONTROLLER);
 	assert(rdma_req != NULL);
 
-	if (spdk_rdma_provider_qp_queue_send_wrs(rqpair->rdma_qp, rdma_req->transfer_wr)) {
-		STAILQ_INSERT_TAIL(&rqpair->poller->qpairs_pending_send, rqpair, send_link);
+	nvmf_rdma_xrc_stamp(rqpair, rdma_req->transfer_wr);
+	if (spdk_rdma_provider_qp_queue_send_wrs(rqpair->sq->rdma_qp, rdma_req->transfer_wr)) {
+		STAILQ_INSERT_TAIL(&rqpair->poller->qpairs_pending_send, rqpair->sq, send_link);
 	}
 	if (rtransport->rdma_opts.no_wr_batching) {
 		_poller_submit_sends(rtransport, rqpair->poller);
 	}
 
-	assert(rqpair->current_read_depth + rdma_req->num_outstanding_data_wr <= rqpair->max_read_depth);
-	rqpair->current_read_depth += rdma_req->num_outstanding_data_wr;
-	assert(rqpair->current_send_depth + rdma_req->num_outstanding_data_wr <= rqpair->max_send_depth);
-	rqpair->current_send_depth += rdma_req->num_outstanding_data_wr;
+	assert(rqpair->sq->current_read_depth + rdma_req->num_outstanding_data_wr <= rqpair->sq->max_read_depth);
+	rqpair->sq->current_read_depth += rdma_req->num_outstanding_data_wr;
+	assert(rqpair->sq->current_send_depth + rdma_req->num_outstanding_data_wr <= rqpair->sq->max_send_depth);
+	rqpair->sq->current_send_depth += rdma_req->num_outstanding_data_wr;
 }
 
 static inline void
@@ -1194,13 +2393,21 @@ request_transfer_out(struct spdk_nvmf_request *req, int *data_posted)
 	rtransport = SPDK_CONTAINEROF(rqpair->qpair.transport,
 				      struct spdk_nvmf_rdma_transport, transport);
 
-	/* Advance our sq_head pointer */
-	if (qpair->sq_head == qpair->sq_head_max) {
-		qpair->sq_head = 0;
+	if (spdk_unlikely(rqpair->xrc != NULL)) {
+		/* Commands of this queue complete on several cores: no SQ head to
+		 * report. The CQE's SQID lets the host find the queue, since all its
+		 * queues on one poller share one receive SRQ. */
+		rsp->sqhd = SPDK_NVMF_RDMA_XRC_SQHD;
+		rsp->sqid = qpair->qid;
 	} else {
-		qpair->sq_head++;
+		/* Advance our sq_head pointer */
+		if (qpair->sq_head == qpair->sq_head_max) {
+			qpair->sq_head = 0;
+		} else {
+			qpair->sq_head++;
+		}
+		rsp->sqhd = qpair->sq_head;
 	}
-	rsp->sqhd = qpair->sq_head;
 
 	/* queue the capsule for the recv buffer */
 	assert(rdma_req->recv != NULL);
@@ -1227,8 +2434,9 @@ request_transfer_out(struct spdk_nvmf_request *req, int *data_posted)
 		*data_posted = 1;
 		num_outstanding_data_wr = rdma_req->num_outstanding_data_wr;
 	}
-	if (spdk_rdma_provider_qp_queue_send_wrs(rqpair->rdma_qp, first)) {
-		STAILQ_INSERT_TAIL(&rqpair->poller->qpairs_pending_send, rqpair, send_link);
+	nvmf_rdma_xrc_stamp(rqpair, first);
+	if (spdk_rdma_provider_qp_queue_send_wrs(rqpair->sq->rdma_qp, first)) {
+		STAILQ_INSERT_TAIL(&rqpair->poller->qpairs_pending_send, rqpair->sq, send_link);
 	}
 	if (rtransport->rdma_opts.no_wr_batching) {
 		_poller_submit_sends(rtransport, rqpair->poller);
@@ -1238,8 +2446,8 @@ request_transfer_out(struct spdk_nvmf_request *req, int *data_posted)
 		      rdma_req->num_outstanding_data_wr);
 
 	/* +1 for the rsp wr */
-	assert(rqpair->current_send_depth + num_outstanding_data_wr + 1 <= rqpair->max_send_depth);
-	rqpair->current_send_depth += num_outstanding_data_wr + 1;
+	assert(rqpair->sq->current_send_depth + num_outstanding_data_wr + 1 <= rqpair->sq->max_send_depth);
+	rqpair->sq->current_send_depth += num_outstanding_data_wr + 1;
 
 	return 0;
 }
@@ -1258,8 +2466,9 @@ request_transfer_out_data(struct spdk_nvmf_request *req)
 				      struct spdk_nvmf_rdma_transport, transport);
 	first = rdma_req->transfer_wr;
 
-	if (spdk_rdma_provider_qp_queue_send_wrs(rqpair->rdma_qp, first)) {
-		STAILQ_INSERT_TAIL(&rqpair->poller->qpairs_pending_send, rqpair, send_link);
+	nvmf_rdma_xrc_stamp(rqpair, first);
+	if (spdk_rdma_provider_qp_queue_send_wrs(rqpair->sq->rdma_qp, first)) {
+		STAILQ_INSERT_TAIL(&rqpair->poller->qpairs_pending_send, rqpair->sq, send_link);
 	}
 	if (rtransport->rdma_opts.no_wr_batching) {
 		_poller_submit_sends(rtransport, rqpair->poller);
@@ -1268,8 +2477,8 @@ request_transfer_out_data(struct spdk_nvmf_request *req)
 	SPDK_DEBUGLOG(rdma, "sent data for req %p, outstanding_wrs %u\n", rdma_req,
 		      rdma_req->num_outstanding_data_wr);
 
-	assert(rqpair->current_send_depth + rdma_req->num_outstanding_data_wr <= rqpair->max_send_depth);
-	rqpair->current_send_depth += rdma_req->num_outstanding_data_wr;
+	assert(rqpair->sq->current_send_depth + rdma_req->num_outstanding_data_wr <= rqpair->sq->max_send_depth);
+	rqpair->sq->current_send_depth += rdma_req->num_outstanding_data_wr;
 
 	return 0;
 }
@@ -1288,7 +2497,7 @@ nvmf_rdma_event_accept(struct rdma_cm_id *id, struct spdk_nvmf_rdma_qpair *rqpai
 	ctrlr_event_data.private_data_len = sizeof(accept_data);
 	if (id->ps == RDMA_PS_TCP) {
 		ctrlr_event_data.responder_resources = 0; /* We accept 0 reads from the host */
-		ctrlr_event_data.initiator_depth = rqpair->max_read_depth;
+		ctrlr_event_data.initiator_depth = rqpair->sq->max_read_depth;
 	}
 
 	/* Configure infinite retries for the initiator side qpair.
@@ -1428,9 +2637,10 @@ nvmf_rdma_connect(struct spdk_nvmf_transport *transport, struct rdma_cm_event *e
 		return -1;
 	}
 
+	rqpair->sq = &rqpair->own_sq;
 	rqpair->device = port->device;
 	rqpair->max_queue_depth = max_queue_depth;
-	rqpair->max_read_depth = max_read_depth;
+	rqpair->sq->max_read_depth = max_read_depth;
 	rqpair->cm_id = event->id;
 	rqpair->listen_id = event->listen_id;
 	rqpair->qpair.transport = transport;
@@ -1445,6 +2655,40 @@ nvmf_rdma_connect(struct spdk_nvmf_transport *transport, struct rdma_cm_event *e
 
 	SPDK_DEBUGLOG(rdma, "qpair %p id %u support accel %s\n", rqpair, rqpair->qpair.qid,
 		      rqpair->start_accel_sequence ? "YES" : "NO");
+
+	if (rdma_param->private_data_len >= sizeof(struct spdk_nvmf_rdma_xrc_request_private_data) &&
+	    ((const struct spdk_nvmf_rdma_xrc_request_private_data *)private_data)->xrc_magic ==
+	    SPDK_NVMF_RDMA_XRC_MAGIC) {
+		const struct spdk_nvmf_rdma_xrc_request_private_data *xpd = (const void *)private_data;
+
+		if (!rtransport->rdma_opts.xrc || xpd->qid == 0 ||
+		    xpd->xrc_version != SPDK_NVMF_RDMA_XRC_VERSION || port->device->xrcd == NULL) {
+			SPDK_ERRLOG("XRC connect request refused (target xrc %d, qid %u, version %u)\n",
+				    rtransport->rdma_opts.xrc, xpd->qid, xpd->xrc_version);
+			free(rqpair);
+			nvmf_rdma_event_reject(event->id, SPDK_NVMF_RDMA_ERROR_INVALID_PRIVATE_DATA_LENGTH);
+			return -1;
+		}
+		rqpair->xrc = calloc(1, sizeof(*rqpair->xrc));
+		if (rqpair->xrc == NULL) {
+			free(rqpair);
+			nvmf_rdma_event_reject(event->id, SPDK_NVMF_RDMA_ERROR_NO_RESOURCES);
+			return -1;
+		}
+		rqpair->xrc->rqpair = rqpair;
+		rqpair->xrc->real = rqpair;
+		rqpair->xrc->resp_srqn = xpd->resp_srqn;
+		rqpair->xrc->session = nvmf_rdma_xrc_session_get(rtransport, port->device, event,
+				       xpd->session_id);
+		if (rqpair->xrc->session == NULL) {
+			free(rqpair->xrc);
+			free(rqpair);
+			nvmf_rdma_event_reject(event->id, SPDK_NVMF_RDMA_ERROR_NO_RESOURCES);
+			return -1;
+		}
+		/* No accel sequences on XRC queues. */
+		rqpair->start_accel_sequence = false;
+	}
 
 	event->id->context = &rqpair->qpair;
 
@@ -2032,6 +3276,22 @@ _nvmf_rdma_request_free(struct spdk_nvmf_rdma_request *rdma_req,
 
 	assert(rdma_req->transfer_cpl_cb == NULL);
 	rqpair = SPDK_CONTAINEROF(rdma_req->req.qpair, struct spdk_nvmf_rdma_qpair, qpair);
+	if (spdk_unlikely(rqpair->xrc != NULL && rdma_req->recv != NULL)) {
+		/* Completed without a response (queue closing, error): give the
+		 * command buffer back to the shared SRQ, or the SRQ shrinks. */
+		struct ibv_recv_wr *bad_recv_wr = NULL;
+
+		rdma_req->recv->wr.next = NULL;
+		spdk_rdma_provider_srq_queue_recv_wrs(rqpair->srq, &rdma_req->recv->wr);
+		if (spdk_rdma_provider_srq_flush_recv_wrs(rqpair->srq, &bad_recv_wr)) {
+			SPDK_ERRLOG("XRC: unable to re-post rx descriptor\n");
+		}
+		rqpair->poller->xrc_recvs_held--;
+		if (rqpair->current_recv_depth > 0) {
+			rqpair->current_recv_depth--;
+		}
+		rdma_req->recv = NULL;
+	}
 	if (rdma_req->req.data_from_pool) {
 		rgroup = rqpair->poller->group;
 
@@ -2270,7 +3530,7 @@ nvmf_rdma_memory_domain_transfer_data(struct spdk_memory_domain *dst_domain, voi
 		 * during RDMA_READ operation. Once transfer_in completes, bdev layer writes data to
 		 * the media */
 		assert(rdma_req->req.data_from_pool);
-		STAILQ_INSERT_TAIL(&rqpair->pending_rdma_read_queue, rdma_req, state_link);
+		NVMF_RDMA_SQ_READ_INSERT(rqpair->sq, rdma_req);
 		rdma_req->state = RDMA_REQUEST_STATE_DATA_TRANSFER_TO_CONTROLLER_PENDING;
 	} else {
 		/* Read IO: The callback is called when data from the bdev is in local buffers. UMR
@@ -2293,7 +3553,7 @@ nvmf_rdma_memory_domain_transfer_data(struct spdk_memory_domain *dst_domain, voi
 			 * when RDMA_WRITE completes and we call the cpl_cb */
 			last->next = NULL;
 			SPDK_DEBUGLOG(rdma, "req %p, lkey %u, transfer C2H\n", rdma_req, translation->rdma.lkey);
-			STAILQ_INSERT_TAIL(&rqpair->pending_rdma_write_queue, rdma_req, state_link);
+			STAILQ_INSERT_TAIL(&rqpair->sq->pending_rdma_write_queue, rdma_req, state_link);
 			rdma_req->state = RDMA_REQUEST_STATE_DATA_TRANSFER_TO_HOST_PENDING;
 		}
 	}
@@ -2372,7 +3632,7 @@ nvmf_rdma_request_append_copy_task(struct spdk_nvmf_rdma_qpair *rqpair,
 		rsp = &rdma_req->req.rsp->nvme_cpl;
 		rsp->status.sct = SPDK_NVME_SCT_GENERIC;
 		rsp->status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
-		STAILQ_INSERT_TAIL(&rqpair->pending_rdma_send_queue, rdma_req, state_link);
+		STAILQ_INSERT_TAIL(&rqpair->sq->pending_rdma_send_queue, rdma_req, state_link);
 		rdma_req->state = RDMA_REQUEST_STATE_READY_TO_COMPLETE_PENDING;
 		SPDK_DEBUGLOG(rdma, "req %p, accel task failed, rc %d\n", rdma_req, rc);
 		return rc;
@@ -2415,21 +3675,21 @@ nvmf_rdma_request_process(struct spdk_nvmf_rdma_transport *rtransport,
 			STAILQ_REMOVE(&rgroup->pending_accel_queue, rdma_req, spdk_nvmf_rdma_request, state_link);
 			break;
 		case RDMA_REQUEST_STATE_DATA_TRANSFER_TO_CONTROLLER_PENDING:
-			STAILQ_REMOVE(&rqpair->pending_rdma_read_queue, rdma_req, spdk_nvmf_rdma_request, state_link);
+			NVMF_RDMA_SQ_READ_REMOVE(rqpair->sq, rdma_req);
 			break;
 		case RDMA_REQUEST_STATE_TRANSFERRING_HOST_TO_CONTROLLER:
 			if (rdma_req->num_remaining_data_wr) {
 				/* Partially sent request is still in the pending_rdma_read_queue,
 				 * remove it before completing */
 				rdma_req->num_remaining_data_wr = 0;
-				STAILQ_REMOVE(&rqpair->pending_rdma_read_queue, rdma_req, spdk_nvmf_rdma_request, state_link);
+				NVMF_RDMA_SQ_READ_REMOVE(rqpair->sq, rdma_req);
 			}
 			break;
 		case RDMA_REQUEST_STATE_DATA_TRANSFER_TO_HOST_PENDING:
-			STAILQ_REMOVE(&rqpair->pending_rdma_write_queue, rdma_req, spdk_nvmf_rdma_request, state_link);
+			STAILQ_REMOVE(&rqpair->sq->pending_rdma_write_queue, rdma_req, spdk_nvmf_rdma_request, state_link);
 			break;
 		case RDMA_REQUEST_STATE_READY_TO_COMPLETE_PENDING:
-			STAILQ_REMOVE(&rqpair->pending_rdma_send_queue, rdma_req, spdk_nvmf_rdma_request, state_link);
+			STAILQ_REMOVE(&rqpair->sq->pending_rdma_send_queue, rdma_req, spdk_nvmf_rdma_request, state_link);
 			break;
 		default:
 			break;
@@ -2472,7 +3732,28 @@ nvmf_rdma_request_process(struct spdk_nvmf_rdma_transport *rtransport,
 				rdma_req->req.dif_enabled = true;
 			}
 
-			nvmf_rdma_check_fused_ordering(rtransport, rqpair, rdma_req);
+			if (spdk_unlikely(rqpair->xrc != NULL)) {
+				if (spdk_unlikely(rdma_req->req.cmd->nvme_cmd.fuse != SPDK_NVME_CMD_FUSE_NONE)) {
+					/* The two halves of a fused pair may run on different
+					 * cores here, so XRC queues refuse fused commands. */
+					rsp->status.sct = SPDK_NVME_SCT_GENERIC;
+					rsp->status.sc = SPDK_NVME_SC_INVALID_FIELD;
+					rsp->status.dnr = 1;
+					STAILQ_INSERT_TAIL(&rqpair->sq->pending_rdma_send_queue, rdma_req, state_link);
+					rdma_req->state = RDMA_REQUEST_STATE_READY_TO_COMPLETE_PENDING;
+					break;
+				}
+				if (spdk_unlikely(!rqpair->xrc->is_shadow &&
+						  rdma_req->req.cmd->nvmf_cmd.opcode == SPDK_NVME_OPC_FABRIC &&
+						  rdma_req->req.cmd->nvmf_cmd.fctype == SPDK_NVMF_FABRIC_COMMAND_CONNECT &&
+						  nvmf_rdma_xrc_session_connect(rqpair, rdma_req) != 0)) {
+					rdma_req->state = RDMA_REQUEST_STATE_COMPLETED;
+					nvmf_rdma_qpair_disconnect(rqpair);
+					break;
+				}
+			} else {
+				nvmf_rdma_check_fused_ordering(rtransport, rqpair, rdma_req);
+			}
 
 #ifdef SPDK_CONFIG_RDMA_SEND_WITH_INVAL
 			rdma_req->rsp.wr.opcode = IBV_WR_SEND;
@@ -2485,7 +3766,7 @@ nvmf_rdma_request_process(struct spdk_nvmf_rdma_transport *rtransport,
 			if (spdk_unlikely(rdma_req->req.xfer == SPDK_NVME_DATA_BIDIRECTIONAL)) {
 				rsp->status.sct = SPDK_NVME_SCT_GENERIC;
 				rsp->status.sc = SPDK_NVME_SC_INVALID_OPCODE;
-				STAILQ_INSERT_TAIL(&rqpair->pending_rdma_send_queue, rdma_req, state_link);
+				STAILQ_INSERT_TAIL(&rqpair->sq->pending_rdma_send_queue, rdma_req, state_link);
 				rdma_req->state = RDMA_REQUEST_STATE_READY_TO_COMPLETE_PENDING;
 				SPDK_DEBUGLOG(rdma, "Request %p: invalid xfer type (BIDIRECTIONAL)\n", rdma_req);
 				break;
@@ -2516,7 +3797,7 @@ nvmf_rdma_request_process(struct spdk_nvmf_rdma_transport *rtransport,
 			rc = nvmf_rdma_request_parse_sgl(rtransport, device, rdma_req);
 			if (spdk_unlikely(rc < 0)) {
 				STAILQ_REMOVE_HEAD(&rgroup->group.pending_buf_queue, buf_link);
-				STAILQ_INSERT_TAIL(&rqpair->pending_rdma_send_queue, rdma_req, state_link);
+				STAILQ_INSERT_TAIL(&rqpair->sq->pending_rdma_send_queue, rdma_req, state_link);
 				rdma_req->state = RDMA_REQUEST_STATE_READY_TO_COMPLETE_PENDING;
 				break;
 			}
@@ -2540,7 +3821,7 @@ nvmf_rdma_request_process(struct spdk_nvmf_rdma_transport *rtransport,
 			 */
 			if (rdma_req->req.xfer == SPDK_NVME_DATA_HOST_TO_CONTROLLER &&
 			    rdma_req->req.data_from_pool) {
-				STAILQ_INSERT_TAIL(&rqpair->pending_rdma_read_queue, rdma_req, state_link);
+				NVMF_RDMA_SQ_READ_INSERT(rqpair->sq, rdma_req);
 				rdma_req->state = RDMA_REQUEST_STATE_DATA_TRANSFER_TO_CONTROLLER_PENDING;
 				break;
 			}
@@ -2564,14 +3845,14 @@ nvmf_rdma_request_process(struct spdk_nvmf_rdma_transport *rtransport,
 			spdk_trace_record(TRACE_RDMA_REQUEST_STATE_DATA_TRANSFER_TO_CONTROLLER_PENDING, 0, 0,
 					  (uintptr_t)rdma_req, (uintptr_t)rqpair);
 
-			if (rdma_req != STAILQ_FIRST(&rqpair->pending_rdma_read_queue)) {
+			if (rdma_req != STAILQ_FIRST(&rqpair->sq->pending_rdma_read_queue)) {
 				/* This request needs to wait in line to perform RDMA */
 				break;
 			}
-			assert(rqpair->max_send_depth >= rqpair->current_send_depth);
-			qdepth = rqpair->max_send_depth - rqpair->current_send_depth;
-			assert(rqpair->max_read_depth >= rqpair->current_read_depth);
-			num_rdma_reads_available = rqpair->max_read_depth - rqpair->current_read_depth;
+			assert(rqpair->sq->max_send_depth >= rqpair->sq->current_send_depth);
+			qdepth = rqpair->sq->max_send_depth - rqpair->sq->current_send_depth;
+			assert(rqpair->sq->max_read_depth >= rqpair->sq->current_read_depth);
+			num_rdma_reads_available = rqpair->sq->max_read_depth - rqpair->sq->current_read_depth;
 			if (rdma_req->num_outstanding_data_wr > qdepth ||
 			    rdma_req->num_outstanding_data_wr > num_rdma_reads_available) {
 				if (num_rdma_reads_available && qdepth) {
@@ -2580,13 +3861,14 @@ nvmf_rdma_request_process(struct spdk_nvmf_rdma_transport *rtransport,
 				} else {
 					/* We can only have so many WRs outstanding. we have to wait until some finish. */
 					rqpair->poller->stat.pending_rdma_read++;
+					rqpair->sq->read_stalls++;
 					break;
 				}
 			}
 
 			/* We have already verified that this request is the head of the queue. */
 			if (rdma_req->num_remaining_data_wr == 0) {
-				STAILQ_REMOVE_HEAD(&rqpair->pending_rdma_read_queue, state_link);
+				NVMF_RDMA_SQ_READ_REMOVE_HEAD(rqpair->sq);
 			}
 
 			request_transfer_in(&rdma_req->req);
@@ -2614,7 +3896,7 @@ nvmf_rdma_request_process(struct spdk_nvmf_rdma_transport *rtransport,
 					if (rc != 0) {
 						SPDK_ERRLOG("DIF generation failed\n");
 						rdma_req->state = RDMA_REQUEST_STATE_COMPLETED;
-						spdk_nvmf_qpair_disconnect(&rqpair->qpair);
+						nvmf_rdma_qpair_disconnect(rqpair);
 						break;
 					}
 				}
@@ -2631,7 +3913,7 @@ nvmf_rdma_request_process(struct spdk_nvmf_rdma_transport *rtransport,
 					 */
 					rsp->status.sct = SPDK_NVME_SCT_GENERIC;
 					rsp->status.sc = SPDK_NVME_SC_ABORTED_MISSING_FUSED;
-					STAILQ_INSERT_TAIL(&rqpair->pending_rdma_send_queue, rdma_req, state_link);
+					STAILQ_INSERT_TAIL(&rqpair->sq->pending_rdma_send_queue, rdma_req, state_link);
 					rdma_req->state = RDMA_REQUEST_STATE_READY_TO_COMPLETE_PENDING;
 					break;
 				}
@@ -2685,10 +3967,10 @@ nvmf_rdma_request_process(struct spdk_nvmf_rdma_transport *rtransport,
 					  (uintptr_t)rdma_req, (uintptr_t)rqpair);
 			if (rsp->status.sc == SPDK_NVME_SC_SUCCESS &&
 			    rdma_req->req.xfer == SPDK_NVME_DATA_CONTROLLER_TO_HOST) {
-				STAILQ_INSERT_TAIL(&rqpair->pending_rdma_write_queue, rdma_req, state_link);
+				STAILQ_INSERT_TAIL(&rqpair->sq->pending_rdma_write_queue, rdma_req, state_link);
 				rdma_req->state = RDMA_REQUEST_STATE_DATA_TRANSFER_TO_HOST_PENDING;
 			} else {
-				STAILQ_INSERT_TAIL(&rqpair->pending_rdma_send_queue, rdma_req, state_link);
+				STAILQ_INSERT_TAIL(&rqpair->sq->pending_rdma_send_queue, rdma_req, state_link);
 				rdma_req->state = RDMA_REQUEST_STATE_READY_TO_COMPLETE_PENDING;
 				if (rdma_req->req.bdev_io) {
 					spdk_bdev_free_io(rdma_req->req.bdev_io);
@@ -2719,8 +4001,8 @@ nvmf_rdma_request_process(struct spdk_nvmf_rdma_transport *rtransport,
 							    error_blk.err_offset);
 						rsp->status.sct = SPDK_NVME_SCT_MEDIA_ERROR;
 						rsp->status.sc = nvmf_rdma_dif_error_to_compl_status(error_blk.err_type);
-						STAILQ_REMOVE(&rqpair->pending_rdma_write_queue, rdma_req, spdk_nvmf_rdma_request, state_link);
-						STAILQ_INSERT_TAIL(&rqpair->pending_rdma_send_queue, rdma_req, state_link);
+						STAILQ_REMOVE(&rqpair->sq->pending_rdma_write_queue, rdma_req, spdk_nvmf_rdma_request, state_link);
+						STAILQ_INSERT_TAIL(&rqpair->sq->pending_rdma_send_queue, rdma_req, state_link);
 						rdma_req->state = RDMA_REQUEST_STATE_READY_TO_COMPLETE_PENDING;
 					}
 				}
@@ -2732,19 +4014,19 @@ nvmf_rdma_request_process(struct spdk_nvmf_rdma_transport *rtransport,
 
 			rsp_needed = rdma_req->transfer_cpl_cb == NULL;
 
-			if (rdma_req != STAILQ_FIRST(&rqpair->pending_rdma_write_queue)) {
+			if (rdma_req != STAILQ_FIRST(&rqpair->sq->pending_rdma_write_queue)) {
 				/* This request needs to wait in line to perform RDMA */
 				break;
 			}
-			if ((rqpair->current_send_depth + rdma_req->num_outstanding_data_wr + rsp_needed) >
-			    rqpair->max_send_depth) {
+			if ((rqpair->sq->current_send_depth + rdma_req->num_outstanding_data_wr + rsp_needed) >
+			    rqpair->sq->max_send_depth) {
 				/* We can only have so many WRs outstanding. we have to wait until some finish */
 				rqpair->poller->stat.pending_rdma_write++;
 				break;
 			}
 
 			/* We have already verified that this request is the head of the queue. */
-			STAILQ_REMOVE_HEAD(&rqpair->pending_rdma_write_queue, state_link);
+			STAILQ_REMOVE_HEAD(&rqpair->sq->pending_rdma_write_queue, state_link);
 
 			/* The data transfer will be kicked off from
 			 * RDMA_REQUEST_STATE_READY_TO_COMPLETE state.
@@ -2756,20 +4038,20 @@ nvmf_rdma_request_process(struct spdk_nvmf_rdma_transport *rtransport,
 			spdk_trace_record(TRACE_RDMA_REQUEST_STATE_READY_TO_COMPLETE_PENDING, 0, 0,
 					  (uintptr_t)rdma_req, (uintptr_t)rqpair);
 
-			if (rdma_req != STAILQ_FIRST(&rqpair->pending_rdma_send_queue)) {
+			if (rdma_req != STAILQ_FIRST(&rqpair->sq->pending_rdma_send_queue)) {
 				/* This request needs to wait in line to send the completion */
 				break;
 			}
 
-			assert(rqpair->current_send_depth <= rqpair->max_send_depth);
-			if (rqpair->current_send_depth == rqpair->max_send_depth) {
+			assert(rqpair->sq->current_send_depth <= rqpair->sq->max_send_depth);
+			if (rqpair->sq->current_send_depth == rqpair->sq->max_send_depth) {
 				/* We can only have so many WRs outstanding. we have to wait until some finish */
 				rqpair->poller->stat.pending_rdma_send++;
 				break;
 			}
 
 			/* We have already verified that this request is the head of the queue. */
-			STAILQ_REMOVE_HEAD(&rqpair->pending_rdma_send_queue, state_link);
+			STAILQ_REMOVE_HEAD(&rqpair->sq->pending_rdma_send_queue, state_link);
 
 			/* The response sending will be kicked off from
 			 * RDMA_REQUEST_STATE_READY_TO_COMPLETE state.
@@ -2956,6 +4238,25 @@ create_ib_device(struct spdk_nvmf_rdma_transport *rtransport, struct ibv_context
 	assert(device->map != NULL);
 	assert(device->pd != NULL);
 
+	pthread_mutex_init(&device->xrc_lock, NULL);
+	RB_INIT(&device->xrc_tgts);
+	TAILQ_INIT(&device->xrc_sessions);
+	if (rtransport->rdma_opts.xrc) {
+		struct ibv_xrcd_init_attr xattr = {
+			.comp_mask = IBV_XRCD_INIT_ATTR_FD | IBV_XRCD_INIT_ATTR_OFLAGS,
+			.fd = -1,
+			.oflags = O_CREAT,
+		};
+
+		device->xrcd = ibv_open_xrcd(device->context, &xattr);
+		if (device->xrcd == NULL) {
+			SPDK_ERRLOG("XRC: ibv_open_xrcd on %s failed: %s\n",
+				    ibv_get_device_name(context->device), spdk_strerror(errno));
+			destroy_ib_device(rtransport, device);
+			return -ENOMEM;
+		}
+	}
+
 	if (new_device) {
 		*new_device = device;
 	}
@@ -3039,6 +4340,9 @@ nvmf_rdma_create(struct spdk_nvmf_transport_opts *opts)
 	rtransport->rdma_opts.acceptor_backlog = SPDK_NVMF_RDMA_ACCEPTOR_BACKLOG;
 	rtransport->rdma_opts.no_wr_batching = SPDK_NVMF_RDMA_DEFAULT_NO_WR_BATCHING;
 	rtransport->rdma_opts.in_capsule_data_disabled = false;
+	rtransport->rdma_opts.xrc = false;
+	rtransport->rdma_opts.xrc_srq_depth = 0;
+	rtransport->rdma_opts.xrc_ini_send_depth = 4096;
 	if (opts->transport_specific != NULL &&
 	    spdk_json_decode_object_relaxed(opts->transport_specific, rdma_transport_opts_decoder,
 					    SPDK_COUNTOF(rdma_transport_opts_decoder),
@@ -3067,6 +4371,19 @@ nvmf_rdma_create(struct spdk_nvmf_transport_opts *opts)
 		     rtransport->rdma_opts.acceptor_backlog,
 		     rtransport->rdma_opts.no_wr_batching,
 		     opts->abort_timeout_sec);
+
+	if (rtransport->rdma_opts.xrc) {
+		if (rtransport->rdma_opts.no_srq) {
+			SPDK_ERRLOG("XRC needs shared receive queues (no_srq must be false)\n");
+			nvmf_rdma_destroy(&rtransport->transport, NULL, NULL);
+			return NULL;
+		}
+		if (rtransport->rdma_opts.xrc_srq_depth == 0) {
+			rtransport->rdma_opts.xrc_srq_depth = rtransport->rdma_opts.max_srq_depth;
+		}
+		SPDK_NOTICELOG("XRC enabled: command SRQ depth %u per poll group, INI QP send depth %u\n",
+			       rtransport->rdma_opts.xrc_srq_depth, rtransport->rdma_opts.xrc_ini_send_depth);
+	}
 
 	/* I/O unit size cannot be larger than max I/O size */
 	if (opts->io_unit_size > opts->max_io_size) {
@@ -3213,6 +4530,13 @@ destroy_ib_device(struct spdk_nvmf_rdma_transport *rtransport,
 		  struct spdk_nvmf_rdma_device *device)
 {
 	TAILQ_REMOVE(&rtransport->devices, device, link);
+	if (device->xrcd != NULL) {
+		if (!TAILQ_EMPTY(&device->xrc_sessions) || !RB_EMPTY(&device->xrc_tgts)) {
+			SPDK_ERRLOG("XRC: device %p destroyed with live sessions or queues\n", device);
+		}
+		ibv_close_xrcd(device->xrcd);
+		device->xrcd = NULL;
+	}
 	spdk_rdma_utils_free_mem_map(&device->map);
 	if (device->pd) {
 		if (!g_nvmf_hooks.get_ibv_pd) {
@@ -3237,6 +4561,11 @@ nvmf_rdma_dump_opts(struct spdk_nvmf_transport *transport, struct spdk_json_writ
 	}
 	spdk_json_write_named_int32(w, "acceptor_backlog", rtransport->rdma_opts.acceptor_backlog);
 	spdk_json_write_named_bool(w, "no_wr_batching", rtransport->rdma_opts.no_wr_batching);
+	if (rtransport->rdma_opts.xrc) {
+		spdk_json_write_named_bool(w, "xrc", true);
+		spdk_json_write_named_uint32(w, "xrc_srq_depth", rtransport->rdma_opts.xrc_srq_depth);
+		spdk_json_write_named_uint32(w, "xrc_ini_send_depth", rtransport->rdma_opts.xrc_ini_send_depth);
+	}
 	if (transport->opts.msdbd != NVMF_DEFAULT_MSDBD) {
 		spdk_json_write_named_bool(w, "msdbd", transport->opts.msdbd);
 	}
@@ -3732,14 +5061,14 @@ nvmf_rdma_qpair_process_pending(struct spdk_nvmf_rdma_transport *rtransport,
 	struct spdk_nvmf_rdma_resources *resources;
 
 	/* First process requests which are waiting for response to be sent */
-	STAILQ_FOREACH_SAFE(rdma_req, &rqpair->pending_rdma_send_queue, state_link, req_tmp) {
+	STAILQ_FOREACH_SAFE(rdma_req, &rqpair->sq->pending_rdma_send_queue, state_link, req_tmp) {
 		if (nvmf_rdma_request_process(rtransport, rdma_req) == false && drain == false) {
 			break;
 		}
 	}
 
 	/* We process I/O in the data transfer pending queue at the highest priority. */
-	STAILQ_FOREACH_SAFE(rdma_req, &rqpair->pending_rdma_read_queue, state_link, req_tmp) {
+	STAILQ_FOREACH_SAFE(rdma_req, &rqpair->sq->pending_rdma_read_queue, state_link, req_tmp) {
 		if (rdma_req->state != RDMA_REQUEST_STATE_DATA_TRANSFER_TO_CONTROLLER_PENDING) {
 			/* Requests in this queue might be in state RDMA_REQUEST_STATE_TRANSFERRING_HOST_TO_CONTROLLER,
 			 * they are transmitting data over network but we keep them in the list to guarantee
@@ -3752,7 +5081,7 @@ nvmf_rdma_qpair_process_pending(struct spdk_nvmf_rdma_transport *rtransport,
 	}
 
 	/* Then RDMA writes since reads have stronger restrictions than writes */
-	STAILQ_FOREACH_SAFE(rdma_req, &rqpair->pending_rdma_write_queue, state_link, req_tmp) {
+	STAILQ_FOREACH_SAFE(rdma_req, &rqpair->sq->pending_rdma_write_queue, state_link, req_tmp) {
 		if (nvmf_rdma_request_process(rtransport, rdma_req) == false && drain == false) {
 			break;
 		}
@@ -3827,6 +5156,13 @@ nvmf_rdma_destroy_drained_qpair(struct spdk_nvmf_rdma_qpair *rqpair)
 	struct spdk_nvmf_rdma_transport *rtransport = SPDK_CONTAINEROF(rqpair->qpair.transport,
 			struct spdk_nvmf_rdma_transport, transport);
 
+	if (nvmf_rdma_is_xrc_shadow(rqpair)) {
+		if (!spdk_nvmf_qpair_is_active(&rqpair->qpair)) {
+			nvmf_rdma_xrc_shadow_schedule_destroy(rqpair);
+		}
+		return;
+	}
+
 	if (rqpair->in_destroy) {
 		return;
 	}
@@ -3848,8 +5184,22 @@ nvmf_rdma_destroy_drained_qpair(struct spdk_nvmf_rdma_qpair *rqpair)
 		return;
 	}
 
+	if (rqpair->xrc != NULL) {
+		/* The INI QP is shared with the host's other queues: wait for this
+		 * queue's own requests and for its shadows on other poll groups.
+		 * Commands still in flight to the closed TGT QP are dropped on
+		 * arrival (no queue for them any more). */
+		if (rqpair->qd != 0 || nvmf_rdma_xrc_real_has_shadows(rqpair)) {
+			goto again;
+		}
+		assert(rqpair->qpair.state == SPDK_NVMF_QPAIR_UNINITIALIZED ||
+		       rqpair->qpair.state == SPDK_NVMF_QPAIR_ERROR);
+		nvmf_rdma_qpair_destroy(rqpair);
+		return;
+	}
+
 	/* In non SRQ path, we will reach rqpair->max_queue_depth. In SRQ path, we will get the last_wqe event. */
-	if (rqpair->current_send_depth != 0) {
+	if (rqpair->sq->current_send_depth != 0) {
 		goto again;
 	}
 
@@ -3900,7 +5250,7 @@ nvmf_rdma_disconnect(struct rdma_cm_event *evt, bool *event_acked)
 
 	spdk_trace_record(TRACE_RDMA_QP_DISCONNECT, 0, 0, (uintptr_t)rqpair);
 
-	spdk_nvmf_qpair_disconnect(&rqpair->qpair);
+	nvmf_rdma_qpair_disconnect(rqpair);
 
 	return 0;
 }
@@ -3938,7 +5288,7 @@ nvmf_rdma_disconnect_qpairs_on_port(struct spdk_nvmf_rdma_transport *rtransport,
 		TAILQ_FOREACH(rpoller, &rgroup->pollers, link) {
 			RB_FOREACH(rqpair, qpairs_tree, &rpoller->qpairs) {
 				if (rqpair->listen_id == port->id) {
-					spdk_nvmf_qpair_disconnect(&rqpair->qpair);
+					nvmf_rdma_qpair_disconnect(rqpair);
 				}
 			}
 		}
@@ -4201,6 +5551,34 @@ nvmf_rdma_send_qpair_last_wqe_event(struct spdk_nvmf_rdma_qpair *rqpair)
 	return rc;
 }
 
+/*
+ * Async event on an XRC TGT or INI QP (their qp_context is NULL). A TGT QP
+ * error ends its queue. An INI QP error also shows up as failed completions
+ * on its poll group, which disconnect the queues using it; here it is logged.
+ */
+static void
+nvmf_rdma_xrc_async_event(struct spdk_nvmf_rdma_device *device, struct ibv_async_event *event)
+{
+	struct spdk_nvmf_rdma_xrc_qpair find = {}, *xrc;
+	struct spdk_nvmf_rdma_qpair *real = NULL;
+
+	find.tgt_qpn = event->element.qp->qp_num;
+	pthread_mutex_lock(&device->xrc_lock);
+	xrc = RB_FIND(xrc_tgt_tree, &device->xrc_tgts, &find);
+	if (xrc != NULL && !xrc->closing) {
+		real = xrc->rqpair;
+	}
+	pthread_mutex_unlock(&device->xrc_lock);
+
+	SPDK_NOTICELOG("XRC: async event %s on %s QP 0x%x\n", ibv_event_type_str(event->event_type),
+		       xrc != NULL ? "TGT" : "INI or unknown", event->element.qp->qp_num);
+	if (real != NULL && (event->event_type == IBV_EVENT_QP_FATAL ||
+			     event->event_type == IBV_EVENT_QP_REQ_ERR ||
+			     event->event_type == IBV_EVENT_QP_ACCESS_ERR)) {
+		spdk_nvmf_qpair_disconnect(&real->qpair);
+	}
+}
+
 static int
 nvmf_process_ib_event(struct spdk_nvmf_rdma_device *device)
 {
@@ -4225,6 +5603,10 @@ nvmf_process_ib_event(struct spdk_nvmf_rdma_device *device)
 	case IBV_EVENT_PATH_MIG_ERR:
 		rqpair = event.element.qp->qp_context;
 		if (!rqpair) {
+			if (device->xrcd != NULL) {
+				nvmf_rdma_xrc_async_event(device, &event);
+				break;
+			}
 			/* Any QP event for NVMe-RDMA initiator may be returned. */
 			SPDK_NOTICELOG("Async QP event for unknown QP: %s\n",
 				       ibv_event_type_str(event.event_type));
@@ -4237,7 +5619,7 @@ nvmf_process_ib_event(struct spdk_nvmf_rdma_device *device)
 			spdk_trace_record(TRACE_RDMA_IBV_ASYNC_EVENT, 0, 0,
 					  (uintptr_t)rqpair, event.event_type);
 			rqpair->ibv_in_error_state = true;
-			spdk_nvmf_qpair_disconnect(&rqpair->qpair);
+			nvmf_rdma_qpair_disconnect(rqpair);
 			break;
 		case IBV_EVENT_QP_LAST_WQE_REACHED:
 			/* This event only occurs for shared receive queues. */
@@ -4467,6 +5849,14 @@ nvmf_rdma_poller_create(struct spdk_nvmf_rdma_transport *rtransport,
 	} else {
 		num_cqe = rtransport->rdma_opts.num_cqe;
 	}
+	if (rtransport->rdma_opts.xrc && device->xrcd != NULL) {
+		/* The XRC SRQ shares the CQ: its receives plus the READs and SENDs
+		 * of the commands it holds, as for the regular SRQ. */
+		poller->max_xrc_srq_depth = spdk_min(rtransport->rdma_opts.xrc_srq_depth,
+						     (uint32_t)device->attr.max_srq_wr);
+		num_cqe += poller->max_xrc_srq_depth * 3;
+		num_cqe = spdk_min(num_cqe, device->attr.max_cqe);
+	}
 
 	cq_init_attr.cqe		= num_cqe;
 	cq_init_attr.comp_vector	= 0;
@@ -4480,6 +5870,51 @@ nvmf_rdma_poller_create(struct spdk_nvmf_rdma_transport *rtransport,
 		return -1;
 	}
 	poller->num_cqe = num_cqe;
+
+	if (poller->max_xrc_srq_depth != 0) {
+		struct ibv_srq_init_attr_ex xattr = {};
+
+		poller->xrc_srq = calloc(1, sizeof(*poller->xrc_srq));
+		if (poller->xrc_srq == NULL) {
+			return -1;
+		}
+		poller->xrc_srq->stats = &poller->stat.qp_stats.recv;
+		poller->xrc_srq->shared_stats = true;
+		xattr.comp_mask = IBV_SRQ_INIT_ATTR_TYPE | IBV_SRQ_INIT_ATTR_XRCD |
+				  IBV_SRQ_INIT_ATTR_CQ | IBV_SRQ_INIT_ATTR_PD;
+		xattr.srq_type = IBV_SRQT_XRC;
+		xattr.xrcd = device->xrcd;
+		xattr.cq = poller->cq->cq;
+		xattr.pd = device->pd;
+		xattr.attr.max_wr = poller->max_xrc_srq_depth;
+		xattr.attr.max_sge = spdk_min(device->attr.max_sge, NVMF_DEFAULT_RX_SGE);
+		poller->xrc_srq->srq = ibv_create_srq_ex(device->context, &xattr);
+		if (poller->xrc_srq->srq == NULL) {
+			SPDK_ERRLOG("XRC: ibv_create_srq_ex failed: %s\n", spdk_strerror(errno));
+			free(poller->xrc_srq);
+			poller->xrc_srq = NULL;
+			return -1;
+		}
+		if (ibv_get_srq_num(poller->xrc_srq->srq, &poller->xrc_srqn)) {
+			SPDK_ERRLOG("XRC: ibv_get_srq_num failed\n");
+			return -1;
+		}
+
+		opts.qp = poller->xrc_srq;
+		opts.map = device->map;
+		opts.qpair = NULL;
+		opts.shared = true;
+		opts.max_queue_depth = poller->max_xrc_srq_depth;
+		opts.in_capsule_data_size = rtransport->transport.opts.in_capsule_data_size;
+		poller->xrc_resources = nvmf_rdma_resources_create(&opts);
+		if (!poller->xrc_resources) {
+			SPDK_ERRLOG("XRC: unable to allocate resources for the command SRQ.\n");
+			return -1;
+		}
+		SPDK_NOTICELOG("XRC: poll group %u on %s: command SRQN 0x%x depth %u, CQ %d\n",
+			       rgroup->xrc_index, ibv_get_device_name(device->context->device),
+			       poller->xrc_srqn, poller->max_xrc_srq_depth, num_cqe);
+	}
 	return 0;
 }
 
@@ -4529,6 +5964,15 @@ nvmf_rdma_poll_group_create(struct spdk_nvmf_transport *transport,
 	TAILQ_INIT(&rgroup->pollers);
 	STAILQ_INIT(&rgroup->pending_accel_queue);
 
+	if (rtransport->rdma_opts.xrc) {
+		if (rtransport->xrc_num_pgs >= SPDK_NVMF_RDMA_XRC_MAX_WORKERS) {
+			SPDK_ERRLOG("XRC supports at most %d poll groups\n", SPDK_NVMF_RDMA_XRC_MAX_WORKERS);
+			free(rgroup);
+			return NULL;
+		}
+		rgroup->xrc_index = rtransport->xrc_num_pgs;
+	}
+
 	TAILQ_FOREACH(device, &rtransport->devices, link) {
 		rc = nvmf_rdma_poller_create(rtransport, rgroup, device, &poller);
 		if (rc < 0) {
@@ -4545,6 +5989,10 @@ nvmf_rdma_poll_group_create(struct spdk_nvmf_transport *transport,
 	}
 
 	TAILQ_INSERT_TAIL(&rtransport->poll_groups, rgroup, link);
+	if (rtransport->rdma_opts.xrc) {
+		rtransport->xrc_pgs[rgroup->xrc_index] = rgroup;
+		rtransport->xrc_num_pgs++;
+	}
 	if (rtransport->conn_sched.next_admin_pg == NULL) {
 		rtransport->conn_sched.next_admin_pg = rgroup;
 		rtransport->conn_sched.next_io_pg = rgroup;
@@ -4634,7 +6082,27 @@ nvmf_rdma_poller_destroy(struct spdk_nvmf_rdma_poller *poller)
 
 	TAILQ_REMOVE(&poller->group->pollers, poller, link);
 	RB_FOREACH_SAFE(qpair, qpairs_tree, &poller->qpairs, tmp_qpair) {
-		nvmf_rdma_qpair_destroy(qpair);
+		if (nvmf_rdma_is_xrc_shadow(qpair)) {
+			nvmf_rdma_xrc_shadow_destroy(qpair);
+		} else {
+			nvmf_rdma_qpair_destroy(qpair);
+		}
+	}
+
+	if (poller->xrc_srq) {
+		if (poller->xrc_recvs_held != 0) {
+			SPDK_ERRLOG("XRC: poller destroyed with %u command buffers not reposted\n",
+				    poller->xrc_recvs_held);
+		}
+		if (poller->xrc_resources) {
+			nvmf_rdma_resources_destroy(poller->xrc_resources);
+		}
+		if (poller->xrc_srq->srq) {
+			spdk_rdma_provider_srq_destroy(poller->xrc_srq);
+		} else {
+			free(poller->xrc_srq);
+		}
+		poller->xrc_srq = NULL;
 	}
 
 	if (poller->srq) {
@@ -4752,7 +6220,11 @@ nvmf_rdma_poll_group_add(struct spdk_nvmf_transport_poll_group *group,
 
 	RB_INSERT(qpairs_tree, &poller->qpairs, rqpair);
 
-	rc = nvmf_rdma_event_accept(rqpair->cm_id, rqpair);
+	if (rqpair->xrc != NULL) {
+		rc = nvmf_rdma_xrc_accept(rqpair);
+	} else {
+		rc = nvmf_rdma_event_accept(rqpair->cm_id, rqpair);
+	}
 	if (rc) {
 		/* Try to reject, but we probably can't */
 		nvmf_rdma_qpair_reject_connection(rqpair);
@@ -4809,6 +6281,10 @@ nvmf_rdma_request_free(struct spdk_nvmf_request *req)
 		if (rc) {
 			SPDK_ERRLOG("Unable to re-post rx descriptor\n");
 		}
+		if (rqpair->xrc != NULL) {
+			rqpair->poller->xrc_recvs_held--;
+			rdma_req->recv = NULL;
+		}
 	}
 
 	_nvmf_rdma_request_free(rdma_req, rtransport);
@@ -4854,6 +6330,16 @@ nvmf_rdma_close_qpair(struct spdk_nvmf_qpair *qpair,
 	if (rqpair->rdma_qp) {
 		spdk_rdma_provider_qp_disconnect(rqpair->rdma_qp);
 	}
+	if (rqpair->xrc != NULL) {
+		if (rqpair->cm_id != NULL && rqpair->qpair.state != SPDK_NVMF_QPAIR_UNINITIALIZED) {
+			/* No QP is attached to the CM id: just send the DREQ. */
+			rdma_disconnect(rqpair->cm_id);
+		}
+		if (nvmf_rdma_xrc_real_close(rqpair, cb_fn, cb_arg)) {
+			/* cb_fn runs once the shadows are gone, then the destroy. */
+			return;
+		}
+	}
 
 	nvmf_rdma_destroy_drained_qpair(rqpair);
 
@@ -4896,7 +6382,7 @@ _poller_reset_failed_recvs(struct spdk_nvmf_rdma_poller *rpoller, struct ibv_rec
 		rdma_recv->qpair->current_recv_depth++;
 		bad_recv_wr = bad_recv_wr->next;
 		SPDK_ERRLOG("Failed to post a recv for the qpair %p with errno %d\n", rdma_recv->qpair, -rc);
-		spdk_nvmf_qpair_disconnect(&rdma_recv->qpair->qpair);
+		nvmf_rdma_qpair_disconnect(rdma_recv->qpair);
 	}
 }
 
@@ -4908,7 +6394,7 @@ _qp_reset_failed_recvs(struct spdk_nvmf_rdma_qpair *rqpair, struct ibv_recv_wr *
 		bad_recv_wr = bad_recv_wr->next;
 		rqpair->current_recv_depth++;
 	}
-	spdk_nvmf_qpair_disconnect(&rqpair->qpair);
+	nvmf_rdma_qpair_disconnect(rqpair);
 }
 
 static void
@@ -4919,6 +6405,12 @@ _poller_submit_recvs(struct spdk_nvmf_rdma_transport *rtransport,
 	struct ibv_recv_wr		*bad_recv_wr;
 	int				rc;
 
+	if (rpoller->xrc_srq) {
+		rc = spdk_rdma_provider_srq_flush_recv_wrs(rpoller->xrc_srq, &bad_recv_wr);
+		if (spdk_unlikely(rc)) {
+			_poller_reset_failed_recvs(rpoller, bad_recv_wr, rc);
+		}
+	}
 	if (rpoller->srq) {
 		rc = spdk_rdma_provider_srq_flush_recv_wrs(rpoller->srq, &bad_recv_wr);
 		if (spdk_unlikely(rc)) {
@@ -4938,29 +6430,30 @@ _poller_submit_recvs(struct spdk_nvmf_rdma_transport *rtransport,
 
 static void
 _qp_reset_failed_sends(struct spdk_nvmf_rdma_transport *rtransport,
-		       struct spdk_nvmf_rdma_qpair *rqpair, struct ibv_send_wr *bad_wr, int rc)
+		       struct spdk_nvmf_rdma_sq *sq, struct ibv_send_wr *bad_wr, int rc)
 {
 	struct spdk_nvmf_rdma_wr	*bad_rdma_wr;
 	struct spdk_nvmf_rdma_request	*prev_rdma_req = NULL, *cur_rdma_req = NULL;
+	struct spdk_nvmf_rdma_qpair	*rqpair = NULL;
 
-	SPDK_ERRLOG("Failed to post a send for the qpair %p with errno %d\n", rqpair, -rc);
+	SPDK_ERRLOG("Failed to post a send for the send queue %p with errno %d\n", sq, -rc);
 	for (; bad_wr != NULL; bad_wr = bad_wr->next) {
 		bad_rdma_wr = (struct spdk_nvmf_rdma_wr *)bad_wr->wr_id;
-		assert(rqpair->current_send_depth > 0);
-		rqpair->current_send_depth--;
+		assert(sq->current_send_depth > 0);
+		sq->current_send_depth--;
 		switch (bad_rdma_wr->type) {
 		case RDMA_WR_TYPE_DATA:
 			cur_rdma_req = SPDK_CONTAINEROF(bad_rdma_wr, struct spdk_nvmf_rdma_request, data_wr);
 			if (bad_wr->opcode == IBV_WR_RDMA_READ) {
-				assert(rqpair->current_read_depth > 0);
-				rqpair->current_read_depth--;
+				assert(sq->current_read_depth > 0);
+				sq->current_read_depth--;
 			}
 			break;
 		case RDMA_WR_TYPE_SEND:
 			cur_rdma_req = SPDK_CONTAINEROF(bad_rdma_wr, struct spdk_nvmf_rdma_request, rsp_wr);
 			break;
 		default:
-			SPDK_ERRLOG("Found a RECV in the list of pending SEND requests for qpair %p\n", rqpair);
+			SPDK_ERRLOG("Found a RECV in the list of pending SEND requests for send queue %p\n", sq);
 			prev_rdma_req = cur_rdma_req;
 			continue;
 		}
@@ -4971,10 +6464,11 @@ _qp_reset_failed_sends(struct spdk_nvmf_rdma_transport *rtransport,
 			continue;
 		}
 
+		rqpair = SPDK_CONTAINEROF(cur_rdma_req->req.qpair, struct spdk_nvmf_rdma_qpair, qpair);
 		switch (cur_rdma_req->state) {
 		case RDMA_REQUEST_STATE_TRANSFERRING_HOST_TO_CONTROLLER:
 			cur_rdma_req->req.rsp->nvme_cpl.status.sc = SPDK_NVME_SC_INTERNAL_DEVICE_ERROR;
-			STAILQ_INSERT_TAIL(&rqpair->pending_rdma_send_queue, cur_rdma_req, state_link);
+			STAILQ_INSERT_TAIL(&sq->pending_rdma_send_queue, cur_rdma_req, state_link);
 			cur_rdma_req->state = RDMA_REQUEST_STATE_READY_TO_COMPLETE_PENDING;
 			break;
 		case RDMA_REQUEST_STATE_TRANSFERRING_CONTROLLER_TO_HOST:
@@ -4982,37 +6476,36 @@ _qp_reset_failed_sends(struct spdk_nvmf_rdma_transport *rtransport,
 			cur_rdma_req->state = RDMA_REQUEST_STATE_COMPLETED;
 			break;
 		default:
-			SPDK_ERRLOG("Found a request in a bad state %d when draining pending SEND requests for qpair %p\n",
-				    cur_rdma_req->state, rqpair);
+			SPDK_ERRLOG("Found a request in a bad state %d when draining pending SEND requests for send queue %p\n",
+				    cur_rdma_req->state, sq);
 			continue;
 		}
 
 		nvmf_rdma_request_process(rtransport, cur_rdma_req);
 		prev_rdma_req = cur_rdma_req;
-	}
 
-	if (spdk_nvmf_qpair_is_active(&rqpair->qpair)) {
-		/* Disconnect the connection. */
-		spdk_nvmf_qpair_disconnect(&rqpair->qpair);
+		if (spdk_nvmf_qpair_is_active(&rqpair->qpair)) {
+			/* Disconnect the connection. */
+			nvmf_rdma_qpair_disconnect(rqpair);
+		}
 	}
-
 }
 
 static void
 _poller_submit_sends(struct spdk_nvmf_rdma_transport *rtransport,
 		     struct spdk_nvmf_rdma_poller *rpoller)
 {
-	struct spdk_nvmf_rdma_qpair	*rqpair;
+	struct spdk_nvmf_rdma_sq	*sq;
 	struct ibv_send_wr		*bad_wr = NULL;
 	int				rc;
 
 	while (!STAILQ_EMPTY(&rpoller->qpairs_pending_send)) {
-		rqpair = STAILQ_FIRST(&rpoller->qpairs_pending_send);
-		rc = spdk_rdma_provider_qp_flush_send_wrs(rqpair->rdma_qp, &bad_wr);
+		sq = STAILQ_FIRST(&rpoller->qpairs_pending_send);
+		rc = spdk_rdma_provider_qp_flush_send_wrs(sq->rdma_qp, &bad_wr);
 
 		/* bad wr always points to the first wr that failed. */
 		if (spdk_unlikely(rc)) {
-			_qp_reset_failed_sends(rtransport, rqpair, bad_wr, rc);
+			_qp_reset_failed_sends(rtransport, sq, bad_wr, rc);
 		}
 		STAILQ_REMOVE_HEAD(&rpoller->qpairs_pending_send, send_link);
 	}
@@ -5063,7 +6556,7 @@ _nvmf_rdma_handle_sigerr(struct spdk_nvmf_rdma_transport *rtransport,
 	assert((wc->wr_id >> 32) == 0);
 	mkey = wc->wr_id;
 
-	max_req_count = rqpair->srq == NULL ? rqpair->max_queue_depth : rqpair->poller->max_srq_depth;
+	max_req_count = nvmf_rdma_qpair_max_reqs(rqpair);
 
 	for (i = 0; i < max_req_count; i++) {
 		struct spdk_nvme_cmd *cmd;
@@ -5179,8 +6672,8 @@ nvmf_rdma_poller_poll(struct spdk_nvmf_rdma_transport *rtransport,
 
 			rdma_req->state = RDMA_REQUEST_STATE_COMPLETED;
 			/* RDMA_WRITE operation completed. +1 since it was chained with rsp WR */
-			assert(rqpair->current_send_depth >= (uint32_t)rdma_req->num_outstanding_data_wr + 1);
-			rqpair->current_send_depth -= rdma_req->num_outstanding_data_wr + 1;
+			assert(rqpair->sq->current_send_depth >= (uint32_t)rdma_req->num_outstanding_data_wr + 1);
+			rqpair->sq->current_send_depth -= rdma_req->num_outstanding_data_wr + 1;
 			rdma_req->num_outstanding_data_wr = 0;
 			SPDK_DEBUGLOG(rdma, "req %p, C2H completed, transfer_cpl_cb %p\n", rdma_req,
 				      rdma_req->transfer_cpl_cb);
@@ -5191,7 +6684,28 @@ nvmf_rdma_poller_poll(struct spdk_nvmf_rdma_transport *rtransport,
 		case RDMA_WR_TYPE_RECV:
 			/* rdma_recv->qpair will be invalid if using an SRQ.  In that case we have to get the qpair from the wc. */
 			rdma_recv = SPDK_CONTAINEROF(rdma_wr, struct spdk_nvmf_rdma_recv, rdma_wr);
-			if (rpoller->srq != NULL) {
+			if (rdma_recv->srq != NULL && rdma_recv->srq == rpoller->xrc_srq) {
+				/* XRC: wc.qp_num is the TGT QP, i.e. the host queue. */
+				rdma_recv->qpair = get_rdma_qpair_from_wc(rpoller, &wc[i]);
+				if (rdma_recv->qpair == NULL && spdk_likely(!wc[i].status)) {
+					rdma_recv->qpair = nvmf_rdma_xrc_shadow_get(rpoller, wc[i].qp_num);
+				}
+				if (spdk_unlikely(rdma_recv->qpair == NULL)) {
+					struct ibv_recv_wr *bad_wr;
+
+					rpoller->stat.xrc_orphan_recvs++;
+					rdma_recv->wr.next = NULL;
+					spdk_rdma_provider_srq_queue_recv_wrs(rpoller->xrc_srq, &rdma_recv->wr);
+					rc = spdk_rdma_provider_srq_flush_recv_wrs(rpoller->xrc_srq, &bad_wr);
+					if (rc) {
+						SPDK_ERRLOG("Failed to re-post recv WR to XRC SRQ, err %d\n", rc);
+					}
+					continue;
+				}
+				rpoller->xrc_recvs_held++;
+				rpoller->stat.xrc_requests++;
+				rdma_recv->qpair->xrc->cmds++;
+			} else if (rpoller->srq != NULL) {
 				rdma_recv->qpair = get_rdma_qpair_from_wc(rpoller, &wc[i]);
 				/* It is possible that there are still some completions for destroyed QP
 				 * associated with SRQ. We just ignore these late completions and re-post
@@ -5215,7 +6729,7 @@ nvmf_rdma_poller_poll(struct spdk_nvmf_rdma_transport *rtransport,
 			if (spdk_likely(!wc[i].status)) {
 				assert(wc[i].opcode == IBV_WC_RECV);
 				if (rqpair->current_recv_depth >= rqpair->max_queue_depth) {
-					spdk_nvmf_qpair_disconnect(&rqpair->qpair);
+					nvmf_rdma_qpair_disconnect(rqpair);
 					break;
 				}
 			}
@@ -5233,11 +6747,11 @@ nvmf_rdma_poller_poll(struct spdk_nvmf_rdma_transport *rtransport,
 
 			assert(rdma_req->num_outstanding_data_wr > 0);
 
-			rqpair->current_send_depth--;
+			rqpair->sq->current_send_depth--;
 			rdma_req->num_outstanding_data_wr--;
 			if (spdk_likely(!wc[i].status)) {
 				if (wc[i].opcode == IBV_WC_RDMA_READ) {
-					rqpair->current_read_depth--;
+					rqpair->sq->current_read_depth--;
 					/* wait for all outstanding reads associated with the same rdma_req to complete before proceeding. */
 					if (rdma_req->num_outstanding_data_wr == 0) {
 						if (rdma_req->num_remaining_data_wr) {
@@ -5277,13 +6791,13 @@ nvmf_rdma_poller_poll(struct spdk_nvmf_rdma_transport *rtransport,
 				 * completed state since it wasn't linked to a send. However, in the RDMA_WRITE
 				 * case, we should wait for the SEND to complete. */
 				if (rdma_req->data.wr.opcode == IBV_WR_RDMA_READ) {
-					rqpair->current_read_depth--;
+					rqpair->sq->current_read_depth--;
 					if (rdma_req->num_outstanding_data_wr == 0) {
 						if (rdma_req->num_remaining_data_wr) {
 							/* Partially sent request is still in the pending_rdma_read_queue,
 							 * remove it now before completing */
 							rdma_req->num_remaining_data_wr = 0;
-							STAILQ_REMOVE(&rqpair->pending_rdma_read_queue, rdma_req, spdk_nvmf_rdma_request, state_link);
+							NVMF_RDMA_SQ_READ_REMOVE(rqpair->sq, rdma_req);
 						}
 						rdma_req->state = RDMA_REQUEST_STATE_COMPLETED;
 						if (rdma_req->transfer_cpl_cb) {
@@ -5310,12 +6824,15 @@ nvmf_rdma_poller_poll(struct spdk_nvmf_rdma_transport *rtransport,
 		if (spdk_unlikely(wc[i].status)) {
 			rqpair->ibv_in_error_state = true;
 			nvmf_rdma_log_wc_status(rqpair, &wc[i]);
+			if (rqpair->xrc != NULL && rdma_wr->type != RDMA_WR_TYPE_RECV) {
+				nvmf_rdma_xrc_ini_failed(rpoller, rqpair->sq);
+			}
 
 			error = true;
 
 			if (spdk_nvmf_qpair_is_active(&rqpair->qpair)) {
 				/* Disconnect the connection. */
-				spdk_nvmf_qpair_disconnect(&rqpair->qpair);
+				nvmf_rdma_qpair_disconnect(rqpair);
 			}
 			if (fail_data_transfer) {
 				fail_data_transfer = false;
@@ -5547,7 +7064,7 @@ nvmf_rdma_request_set_abort_status(struct spdk_nvmf_request *req,
 	rdma_req_to_abort->req.rsp->nvme_cpl.status.p = 0;
 	rdma_req_to_abort->req.rsp->nvme_cpl.cid = rdma_req_to_abort->req.cmd->nvme_cmd.cid;
 
-	STAILQ_INSERT_TAIL(&rqpair->pending_rdma_send_queue, rdma_req_to_abort, state_link);
+	STAILQ_INSERT_TAIL(&rqpair->sq->pending_rdma_send_queue, rdma_req_to_abort, state_link);
 	rdma_req_to_abort->state = RDMA_REQUEST_STATE_READY_TO_COMPLETE_PENDING;
 
 	req->rsp->nvme_cpl.cdw0 &= ~1U;	/* Command was successfully aborted. */
@@ -5588,14 +7105,13 @@ _nvmf_rdma_qpair_abort_request(void *ctx)
 		break;
 
 	case RDMA_REQUEST_STATE_DATA_TRANSFER_TO_CONTROLLER_PENDING:
-		STAILQ_REMOVE(&rqpair->pending_rdma_read_queue, rdma_req_to_abort,
-			      spdk_nvmf_rdma_request, state_link);
+		NVMF_RDMA_SQ_READ_REMOVE(rqpair->sq, rdma_req_to_abort);
 
 		nvmf_rdma_request_set_abort_status(req, rdma_req_to_abort, rqpair);
 		break;
 
 	case RDMA_REQUEST_STATE_DATA_TRANSFER_TO_HOST_PENDING:
-		STAILQ_REMOVE(&rqpair->pending_rdma_write_queue, rdma_req_to_abort,
+		STAILQ_REMOVE(&rqpair->sq->pending_rdma_write_queue, rdma_req_to_abort,
 			      spdk_nvmf_rdma_request, state_link);
 
 		nvmf_rdma_request_set_abort_status(req, rdma_req_to_abort, rqpair);
@@ -5603,7 +7119,7 @@ _nvmf_rdma_qpair_abort_request(void *ctx)
 
 	case RDMA_REQUEST_STATE_READY_TO_COMPLETE_PENDING:
 		/* Remove req from the list here to re-use common function */
-		STAILQ_REMOVE(&rqpair->pending_rdma_send_queue, rdma_req_to_abort,
+		STAILQ_REMOVE(&rqpair->sq->pending_rdma_send_queue, rdma_req_to_abort,
 			      spdk_nvmf_rdma_request, state_link);
 
 		nvmf_rdma_request_set_abort_status(req, rdma_req_to_abort, rqpair);
@@ -5639,8 +7155,14 @@ nvmf_rdma_qpair_abort_request(struct spdk_nvmf_qpair *qpair,
 	rtransport = SPDK_CONTAINEROF(qpair->transport, struct spdk_nvmf_rdma_transport, transport);
 	transport = &rtransport->transport;
 
+	if (rqpair->xrc != NULL) {
+		/* The command may be running on any poll group. */
+		nvmf_rdma_xrc_abort_request(rqpair, req);
+		return;
+	}
+
 	cid = req->cmd->nvme_cmd.cdw10_bits.abort.cid;
-	max_req_count = rqpair->srq == NULL ? rqpair->max_queue_depth : rqpair->poller->max_srq_depth;
+	max_req_count = nvmf_rdma_qpair_max_reqs(rqpair);
 
 	for (i = 0; i < max_req_count; i++) {
 		rdma_req = &rqpair->resources->reqs[i];
@@ -5665,6 +7187,79 @@ nvmf_rdma_qpair_abort_request(struct spdk_nvmf_qpair *qpair,
 	req->poller = NULL;
 
 	_nvmf_rdma_qpair_abort_request(req);
+}
+
+/* XRC state of one (poll group, device), for nvmf_get_stats. Everything read
+ * here belongs to this poll group's thread, which runs the dump. */
+static void
+nvmf_rdma_xrc_dump_poller(struct spdk_nvmf_rdma_poller *rpoller, struct spdk_json_write_ctx *w)
+{
+	struct spdk_nvmf_rdma_device *device = rpoller->device;
+	struct spdk_nvmf_rdma_xrc_session *session;
+	struct spdk_nvmf_rdma_qpair *rqpair;
+	struct spdk_nvmf_rdma_xrc_ini *ini;
+	struct spdk_nvmf_request *req;
+	uint32_t worker = nvmf_rdma_poller_worker(rpoller), n;
+
+	spdk_json_write_named_object_begin(w, "xrc");
+	spdk_json_write_named_uint32(w, "worker", worker);
+	spdk_json_write_named_uint32(w, "srqn", rpoller->xrc_srqn);
+	spdk_json_write_named_uint32(w, "srq_depth", rpoller->max_xrc_srq_depth);
+	spdk_json_write_named_uint32(w, "recvs_held", rpoller->xrc_recvs_held);
+	spdk_json_write_named_uint64(w, "requests", rpoller->stat.xrc_requests);
+	spdk_json_write_named_uint64(w, "orphan_recvs", rpoller->stat.xrc_orphan_recvs);
+	spdk_json_write_named_uint64(w, "shadows_created", rpoller->stat.xrc_shadows_created);
+	spdk_json_write_named_uint64(w, "shadows_destroyed", rpoller->stat.xrc_shadows_destroyed);
+
+	spdk_json_write_named_array_begin(w, "ini_qps");
+	pthread_mutex_lock(&device->xrc_lock);
+	TAILQ_FOREACH(session, &device->xrc_sessions, link) {
+		if (worker >= session->num_ini) {
+			continue;
+		}
+		ini = &session->ini[worker];
+		spdk_json_write_object_begin(w);
+		spdk_json_write_named_string_fmt(w, "session", "0x%" PRIx64, session->id);
+		spdk_json_write_named_string(w, "hostnqn", session->hostnqn);
+		spdk_json_write_named_uint32(w, "qpn", ini->qp ? ini->qp->qp_num : 0);
+		spdk_json_write_named_uint32(w, "host_tgt_qpn", ini->host_tgt_qpn);
+		spdk_json_write_named_bool(w, "in_error", ini->in_error);
+		spdk_json_write_named_uint32(w, "send_depth", ini->sq.current_send_depth);
+		spdk_json_write_named_uint32(w, "max_send_depth", ini->sq.max_send_depth);
+		spdk_json_write_named_uint32(w, "read_depth", ini->sq.current_read_depth);
+		spdk_json_write_named_uint32(w, "max_read_depth", ini->sq.max_read_depth);
+		spdk_json_write_named_uint32(w, "pending_read", ini->sq.pending_read_len);
+		spdk_json_write_named_uint32(w, "pending_read_peak", ini->sq.pending_read_peak);
+		spdk_json_write_named_uint64(w, "read_stalls", ini->sq.read_stalls);
+		spdk_json_write_named_bool(w, "pending_write_empty", STAILQ_EMPTY(&ini->sq.pending_rdma_write_queue));
+		spdk_json_write_named_bool(w, "pending_send_empty", STAILQ_EMPTY(&ini->sq.pending_rdma_send_queue));
+		spdk_json_write_object_end(w);
+	}
+	pthread_mutex_unlock(&device->xrc_lock);
+	spdk_json_write_array_end(w);
+
+	spdk_json_write_named_array_begin(w, "queues");
+	RB_FOREACH(rqpair, qpairs_tree, &rpoller->qpairs) {
+		if (rqpair->xrc == NULL) {
+			continue;
+		}
+		n = 0;
+		TAILQ_FOREACH(req, &rqpair->qpair.outstanding, link) {
+			n++;
+		}
+		spdk_json_write_object_begin(w);
+		spdk_json_write_named_uint32(w, "qid", rqpair->qpair.qid);
+		spdk_json_write_named_uint32(w, "cntlid", rqpair->qpair.ctrlr ? rqpair->qpair.ctrlr->cntlid : 0);
+		spdk_json_write_named_bool(w, "shadow", rqpair->xrc->is_shadow);
+		spdk_json_write_named_uint32(w, "tgt_qpn", rqpair->xrc->tgt_qpn);
+		spdk_json_write_named_uint64(w, "commands", rqpair->xrc->cmds);
+		spdk_json_write_named_uint32(w, "qd", rqpair->qd);
+		spdk_json_write_named_uint32(w, "outstanding", n);
+		spdk_json_write_named_uint32(w, "recv_depth", rqpair->current_recv_depth);
+		spdk_json_write_object_end(w);
+	}
+	spdk_json_write_array_end(w);
+	spdk_json_write_object_end(w);
 }
 
 static void
@@ -5713,6 +7308,9 @@ nvmf_rdma_poll_group_dump_stat(struct spdk_nvmf_transport_poll_group *group,
 					     rpoller->stat.qp_stats.recv.num_submitted_wrs);
 		spdk_json_write_named_uint64(w, "recv_doorbell_updates",
 					     rpoller->stat.qp_stats.recv.doorbell_updates);
+		if (rpoller->xrc_srq != NULL) {
+			nvmf_rdma_xrc_dump_poller(rpoller, w);
+		}
 		spdk_json_write_object_end(w);
 	}
 
