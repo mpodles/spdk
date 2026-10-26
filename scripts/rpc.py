@@ -719,6 +719,10 @@ def main():
                    action='store_false', dest='rdma_umr_per_io')
     p.add_argument('--tcp-connect-timeout-ms',
                    help='Time to wait until TCP connection is done. Default: 0 (no timeout).', type=int)
+    p.add_argument('--rdma-xrc', help='RDMA I/O queues over XRC (target needs nvmf_create_transport --xrc)',
+                   action='store_true')
+    p.add_argument('--rdma-xrc-steering', help='Target poll group per command with --rdma-xrc: 0 home, 1 rr, 2 random',
+                   type=int)
 
     p.set_defaults(func=bdev_nvme_set_options)
 

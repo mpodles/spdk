@@ -108,8 +108,12 @@ struct spdk_bdev_nvme_opts {
 	uint32_t small_cache_size;
 	uint32_t large_cache_size;
 	bool rdma_umr_per_io;
-	/* Hole at bytes 133-135. */
-	uint8_t reserved133[3];
+	/* RDMA I/O queues over XRC (spdk_nvme_transport_opts.rdma_xrc). */
+	bool rdma_xrc;
+	/* Steering policy for rdma_xrc: 0 home, 1 rr, 2 random. */
+	uint8_t rdma_xrc_steering;
+	/* Hole at byte 135. */
+	uint8_t reserved135;
 	uint32_t tcp_connect_timeout_ms;
 };
 SPDK_STATIC_ASSERT(sizeof(struct spdk_bdev_nvme_opts) == 144, "Incorrect size");

@@ -6758,6 +6758,8 @@ spdk_bdev_nvme_get_opts(struct spdk_bdev_nvme_opts *opts, size_t opts_size)
 	SET_FIELD(large_cache_size, 0);
 	SET_FIELD(rdma_umr_per_io, false);
 	SET_FIELD(tcp_connect_timeout_ms, 0);
+	SET_FIELD(rdma_xrc, false);
+	SET_FIELD(rdma_xrc_steering, 0);
 
 #undef SET_FIELD
 
@@ -6840,6 +6842,8 @@ spdk_bdev_nvme_set_opts(const struct spdk_bdev_nvme_opts *opts)
 	if (opts->tcp_connect_timeout_ms != 0) {
 		drv_opts.tcp_connect_timeout_ms = opts->tcp_connect_timeout_ms;
 	}
+	drv_opts.rdma_xrc = opts->rdma_xrc;
+	drv_opts.rdma_xrc_steering = opts->rdma_xrc_steering;
 	ret = spdk_nvme_transport_set_opts(&drv_opts, sizeof(drv_opts));
 	if (ret) {
 		SPDK_ERRLOG("Failed to set NVMe transport opts.\n");
@@ -6883,6 +6887,8 @@ spdk_bdev_nvme_set_opts(const struct spdk_bdev_nvme_opts *opts)
 	SET_FIELD(large_cache_size, 0);
 	SET_FIELD(rdma_umr_per_io, 0);
 	SET_FIELD(tcp_connect_timeout_ms, 0);
+	SET_FIELD(rdma_xrc, false);
+	SET_FIELD(rdma_xrc_steering, 0);
 
 	g_opts.opts_size = opts->opts_size;
 
@@ -9615,6 +9621,8 @@ bdev_nvme_opts_config_json(struct spdk_json_write_ctx *w)
 	spdk_json_write_named_uint32(w, "small_cache_size", g_opts.small_cache_size);
 	spdk_json_write_named_uint32(w, "large_cache_size", g_opts.large_cache_size);
 	spdk_json_write_named_bool(w, "rdma_umr_per_io", g_opts.rdma_umr_per_io);
+	spdk_json_write_named_bool(w, "rdma_xrc", g_opts.rdma_xrc);
+	spdk_json_write_named_uint32(w, "rdma_xrc_steering", g_opts.rdma_xrc_steering);
 	spdk_json_write_named_uint32(w, "tcp_connect_timeout_ms", g_opts.tcp_connect_timeout_ms);
 	spdk_json_write_object_end(w);
 
