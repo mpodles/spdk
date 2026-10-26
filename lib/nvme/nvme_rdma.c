@@ -1605,6 +1605,44 @@ nvme_rdma_xrc_complete_connect(struct nvme_rdma_qpair *rqpair, struct rdma_cm_ev
 	return 0;
 }
 
+/*
+ * Test hook for the error-path tests, off unless SPDK_NVME_RDMA_XRC_FAULT is
+ * set: "rkey:N" corrupts the rkey of the N-th I/O command with a keyed SGL
+ * sent on XRC queue qid 1 of this process, so the target's RDMA READ/WRITE
+ * for it fails with a remote access error.
+ */
+static int64_t g_nvme_rdma_xrc_fault_rkey = -2;
+static uint64_t g_nvme_rdma_xrc_fault_count;
+
+static void
+nvme_rdma_xrc_fault(struct nvme_rdma_qpair *rqpair, struct spdk_nvme_rdma_req *rdma_req)
+{
+	struct spdk_nvme_sgl_descriptor *sgl;
+	const char *env;
+
+	if (g_nvme_rdma_xrc_fault_rkey == -2) {
+		env = getenv("SPDK_NVME_RDMA_XRC_FAULT");
+		g_nvme_rdma_xrc_fault_rkey = -1;
+		if (env != NULL && strncmp(env, "rkey:", 5) == 0) {
+			g_nvme_rdma_xrc_fault_rkey = strtoll(env + 5, NULL, 10);
+			SPDK_WARNLOG("XRC fault injection: corrupt rkey of keyed command %" PRId64 " on qid 1\n",
+				     g_nvme_rdma_xrc_fault_rkey);
+		}
+	}
+	if (g_nvme_rdma_xrc_fault_rkey < 0 || rqpair->qpair.id != 1) {
+		return;
+	}
+	sgl = &rqpair->cmds[rdma_req->id].cmd.dptr.sgl1;
+	if (sgl->generic.type != SPDK_NVME_SGL_TYPE_KEYED_DATA_BLOCK) {
+		return;
+	}
+	if (++g_nvme_rdma_xrc_fault_count == (uint64_t)g_nvme_rdma_xrc_fault_rkey) {
+		SPDK_WARNLOG("XRC fault injection: qid 1 cid %u rkey 0x%x -> 0x%x\n", rdma_req->id,
+			     sgl->keyed.key, sgl->keyed.key ^ 0x00ff00ffu);
+		sgl->keyed.key ^= 0x00ff00ffu;
+	}
+}
+
 /* Fabrics Connect of an XRC queue: tell the target our TGT QPNs. */
 static int
 nvme_rdma_xrc_fill_connect(struct nvme_rdma_qpair *rqpair, struct nvme_request *req)
@@ -3487,6 +3525,10 @@ nvme_rdma_qpair_submit_request(struct spdk_nvme_qpair *qpair,
 		SPDK_ERRLOG("nvme_rdma_req_init() failed\n");
 		nvme_rdma_req_put(rqpair, rdma_req);
 		return -1;
+	}
+
+	if (spdk_unlikely(nvme_rdma_qpair_is_xrc(rqpair) && g_nvme_rdma_xrc_fault_rkey != -1)) {
+		nvme_rdma_xrc_fault(rqpair, rdma_req);
 	}
 
 	TAILQ_INSERT_TAIL(&rqpair->outstanding_reqs, rdma_req, link);
