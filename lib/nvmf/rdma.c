@@ -693,6 +693,9 @@ enum nvmf_rdma_xrc_session_state {
 };
 
 /* One XRC INI QP: poll group -> one host session. Owned by its poller's thread. */
+/* RNR NAK timer of target TGT QPs: IB encoding 4 = 0.04 ms. */
+#define NVMF_RDMA_XRC_MIN_RNR_TIMER	4
+
 struct spdk_nvmf_rdma_xrc_ini {
 	struct ibv_qp				*qp;
 	struct spdk_rdma_provider_qp		rdma_qp;
@@ -1219,7 +1222,22 @@ nvmf_rdma_xrc_tgt_create(struct spdk_nvmf_rdma_qpair *rqpair)
 	a.rq_psn = cm.rq_psn;
 	/* The host never RDMA-READs the target. */
 	a.max_dest_rd_atomic = 0;
-	a.min_rnr_timer = cm.min_rnr_timer;
+	/*
+	 * The CM hands out min_rnr_timer 0, which encodes 655 ms: with an
+	 * oversubscribed XRC SRQ every RNR NAK then stalls the host's INI QP,
+	 * and with it the whole queue, for 655 ms. Ask for 40 us instead
+	 * (encoding 4), about one command's service time.
+	 */
+	{
+		static bool logged;
+
+		if (!logged) {
+			logged = true;
+			SPDK_NOTICELOG("XRC: CM min_rnr_timer %u, TGT QPs use %u\n", cm.min_rnr_timer,
+				       NVMF_RDMA_XRC_MIN_RNR_TIMER);
+		}
+	}
+	a.min_rnr_timer = NVMF_RDMA_XRC_MIN_RNR_TIMER;
 	if (ibv_modify_qp(xrc->tgt_qp, &a, IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
 			  IBV_QP_DEST_QPN | IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC |
 			  IBV_QP_MIN_RNR_TIMER)) {
