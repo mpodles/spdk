@@ -151,6 +151,9 @@ struct nvme_rdma_poller {
 	uint32_t			xrc_srqn;
 	struct nvme_rdma_rsps		*xrc_rsps;
 	struct nvme_rdma_xrc_dev	*xrc_dev;
+	/* XRC response buffers flushed by the NIC, and those that came back. */
+	uint64_t			xrc_flushed_rsps;
+	uint64_t			xrc_flushed_back;
 	uint32_t			xrc_num_sessions;
 	struct nvme_rdma_xrc_session	*xrc_sessions[NVME_RDMA_XRC_MAX_POLLER_SESSIONS];
 	uint32_t			xrc_session_refs[NVME_RDMA_XRC_MAX_POLLER_SESSIONS];
@@ -275,6 +278,7 @@ struct nvme_rdma_qpair {
 	uint32_t				xrc_rr;
 	uint32_t				xrc_rand;
 	uint64_t				xrc_sent[SPDK_NVMF_RDMA_XRC_MAX_WORKERS];
+	uint64_t				xrc_stray_rsps;
 };
 
 enum NVME_RDMA_COMPLETION_FLAGS {
@@ -317,6 +321,8 @@ struct spdk_nvme_rdma_rsp {
 	struct nvme_rdma_wr	rdma_wr;
 	/* SRQ this buffer is posted to, NULL for a per-qpair RQ. */
 	struct spdk_rdma_provider_srq *srq;
+	/* XRC: flushed by the NIC and not reposted (see the receive path). */
+	bool			xrc_flushed;
 };
 
 static const char *rdma_cm_event_str[] = {
@@ -368,6 +374,7 @@ static int nvme_rdma_poller_xrc_session_add(struct nvme_rdma_poller *poller,
 		struct nvme_rdma_xrc_session *session);
 static void nvme_rdma_poller_xrc_session_del(struct nvme_rdma_poller *poller,
 		struct nvme_rdma_xrc_session *session);
+static void nvme_rdma_xrc_session_fail(struct nvme_rdma_xrc_session *session, const char *why);
 
 static inline struct nvme_rdma_qpair *
 nvme_rdma_qpair(struct spdk_nvme_qpair *qpair)
@@ -490,6 +497,9 @@ nvme_rdma_qpair_process_cm_event(struct nvme_rdma_qpair *rqpair)
 			break;
 		case RDMA_CM_EVENT_UNREACHABLE:
 		case RDMA_CM_EVENT_REJECTED:
+			if (nvme_rdma_qpair_is_xrc(rqpair) && rqpair->xrc_session != NULL) {
+				nvme_rdma_xrc_session_fail(rqpair->xrc_session, "target refused a queue");
+			}
 			break;
 		case RDMA_CM_EVENT_CONNECT_RESPONSE:
 			if (nvme_rdma_qpair_is_xrc(rqpair)) {
@@ -1062,6 +1072,9 @@ struct nvme_rdma_xrc_session {
 	uint32_t			refcnt;
 	/* Set by the first CM REP. */
 	bool				have_target;
+	/* A TGT QP failed, or the target refused or changed the session: new
+	 * queues start a new session; queues already here keep this one. */
+	bool				dead;
 	uint32_t			num_workers;
 	uint32_t			srqn[SPDK_NVMF_RDMA_XRC_MAX_WORKERS];
 	uint32_t			ini_qpn[SPDK_NVMF_RDMA_XRC_MAX_WORKERS];
@@ -1162,6 +1175,11 @@ nvme_rdma_xrc_session_get(struct nvme_rdma_ctrlr *rctrlr, struct ibv_context *ct
 {
 	struct nvme_rdma_xrc_session *session = rctrlr->xrc_session;
 
+	if (session != NULL && session->dead) {
+		/* Its remaining queues hold their own references. */
+		rctrlr->xrc_session = NULL;
+		session = NULL;
+	}
 	if (session != NULL) {
 		if (session->dev->ctx != ctx) {
 			SPDK_ERRLOG("XRC: all I/O queues of a controller must use one device\n");
@@ -1220,6 +1238,15 @@ nvme_rdma_xrc_session_put(struct nvme_rdma_ctrlr *rctrlr, struct nvme_rdma_xrc_s
 	nvme_rdma_xrc_dev_put(session->dev);
 	free(session->qpairs);
 	free(session);
+}
+
+static void
+nvme_rdma_xrc_session_fail(struct nvme_rdma_xrc_session *session, const char *why)
+{
+	if (!session->dead) {
+		session->dead = true;
+		SPDK_NOTICELOG("XRC: host session 0x%" PRIx64 " takes no new queues (%s)\n", session->id, why);
+	}
 }
 
 /* Poller's response SRQ, created when its first XRC queue arrives. */
@@ -1383,8 +1410,8 @@ nvme_rdma_xrc_qpair_fini(struct nvme_rdma_qpair *rqpair)
 	for (i = 0; i < session->num_workers && off < sizeof(dist); i++) {
 		off += snprintf(dist + off, sizeof(dist) - off, "%s%" PRIu64, i ? " " : "", rqpair->xrc_sent[i]);
 	}
-	SPDK_NOTICELOG("XRC: host qid %u (home %u) commands sent per target worker: [%s]\n",
-		       rqpair->qpair.id, rqpair->xrc_home, dist);
+	SPDK_NOTICELOG("XRC: host qid %u (home %u) commands sent per target worker: [%s], stray responses %"
+		       PRIu64 "\n", rqpair->qpair.id, rqpair->xrc_home, dist, rqpair->xrc_stray_rsps);
 	if (rqpair->qpair.id <= session->max_qid && session->qpairs[rqpair->qpair.id] == rqpair) {
 		session->qpairs[rqpair->qpair.id] = NULL;
 	}
@@ -1512,11 +1539,13 @@ nvme_rdma_xrc_complete_connect(struct nvme_rdma_qpair *rqpair, struct rdma_cm_ev
 	} else {
 		if (n != session->num_workers) {
 			SPDK_ERRLOG("XRC: target worker count changed (%u -> %u)\n", session->num_workers, n);
+			nvme_rdma_xrc_session_fail(session, "target worker count changed");
 			return -EPROTO;
 		}
 		for (i = 0; i < n; i++) {
 			if (session->srqn[i] != pd->data[i] || session->ini_qpn[i] != pd->data[n + i]) {
 				SPDK_ERRLOG("XRC: target topology of session 0x%" PRIx64 " changed\n", session->id);
+				nvme_rdma_xrc_session_fail(session, "target topology changed");
 				return -EPROTO;
 			}
 		}
@@ -1621,6 +1650,24 @@ nvme_rdma_xrc_qpair_from_wc(struct nvme_rdma_poller *poller, struct ibv_wc *wc,
 		}
 	}
 	return NULL;
+}
+
+/* A TGT QP of this poller's sessions went to error: that session is done. */
+static void
+nvme_rdma_xrc_tgt_failed(struct nvme_rdma_poller *poller, uint32_t qp_num)
+{
+	struct nvme_rdma_xrc_session *session;
+	uint32_t s, i;
+
+	for (s = 0; s < poller->xrc_num_sessions; s++) {
+		session = poller->xrc_sessions[s];
+		for (i = 0; i < session->num_workers; i++) {
+			if (session->tgt_qpn[i] == qp_num) {
+				nvme_rdma_xrc_session_fail(session, "TGT QP in error");
+				return;
+			}
+		}
+	}
 }
 
 /* The poller lists the sessions of its XRC queues, for the lookup above. */
@@ -1940,6 +1987,7 @@ nvme_rdma_connect(struct nvme_rdma_qpair *rqpair)
 		xpd->xrc_version = SPDK_NVMF_RDMA_XRC_VERSION;
 		xpd->resp_srqn = rqpair->poller->xrc_srqn;
 		xpd->session_id = rqpair->xrc_session->id;
+		xpd->flags = rqpair->xrc_session->have_target ? SPDK_NVMF_RDMA_XRC_REQ_JOIN : 0;
 	}
 	param.retry_count = ctrlr->opts.transport_retry_count;
 	param.rnr_retry_count = 7;
@@ -3629,6 +3677,28 @@ nvme_rdma_process_recv_completion(struct nvme_rdma_poller *poller, struct ibv_wc
 
 	if (poller && rdma_rsp->srq != NULL && rdma_rsp->srq == poller->xrc_srq) {
 		rqpair = spdk_likely(!wc->status) ? nvme_rdma_xrc_qpair_from_wc(poller, wc, &rdma_rsp->cpl) : NULL;
+		if (spdk_unlikely(wc->status)) {
+			/*
+			 * An XRC TGT QP went to error and the NIC flushed SRQ buffers
+			 * with it. On CX7 (fw 28.48) reposting them puts a buffer in the
+			 * SRQ twice: two responses land in one buffer, one is lost and
+			 * the other completes twice. Leave them out; a buffer that the
+			 * NIC still holds comes back with a later good completion.
+			 */
+			if (!rdma_rsp->xrc_flushed) {
+				rdma_rsp->xrc_flushed = true;
+				poller->xrc_flushed_rsps++;
+			}
+			nvme_rdma_xrc_tgt_failed(poller, wc->qp_num);
+			SPDK_NOTICELOG("XRC: response buffer %p flushed (TGT QP 0x%x, %s), not reposted\n",
+				       rdma_rsp, wc->qp_num, ibv_wc_status_str(wc->status));
+			return 0;
+		}
+		if (spdk_unlikely(rdma_rsp->xrc_flushed)) {
+			/* The NIC still had it: it is back in normal use. */
+			rdma_rsp->xrc_flushed = false;
+			poller->xrc_flushed_back++;
+		}
 		if (spdk_unlikely(!rqpair)) {
 			/* Queue gone, or a flushed receive: the buffer goes back. */
 			if (!wc->status) {
@@ -3677,7 +3747,24 @@ nvme_rdma_process_recv_completion(struct nvme_rdma_poller *poller, struct ibv_wc
 		SPDK_ERRLOG("recv length %u less than expected response size\n", wc->byte_len);
 		goto err_wc;
 	}
+	if (spdk_unlikely(rdma_rsp->cpl.cid >= rqpair->num_entries)) {
+		SPDK_ERRLOG("Response with cid %u beyond queue size %u (qid %u)\n", rdma_rsp->cpl.cid,
+			    rqpair->num_entries, rqpair->qpair.id);
+		goto err_wc;
+	}
 	rdma_req = nvme_rdma_qpair_get_req_by_idx(rqpair, rdma_rsp->cpl.cid);
+	if (spdk_unlikely(nvme_rdma_qpair_is_xrc(rqpair) &&
+			  (rdma_req->req == NULL || (rdma_req->completion_flags & NVME_RDMA_RECV_COMPLETED)))) {
+		/* A response for no outstanding command: never let it complete the
+		 * next command that reuses the CID before that command's data. */
+		rqpair->xrc_stray_rsps++;
+		SPDK_ERRLOG("XRC: stray response qid %u cid %u (TGT QP 0x%x, status sct %u sc %u, %s)\n",
+			    rqpair->qpair.id, rdma_rsp->cpl.cid, wc->qp_num, rdma_rsp->cpl.status.sct,
+			    rdma_rsp->cpl.status.sc, rdma_req->req == NULL ? "free CID" : "CID already answered");
+		rqpair->rsps->current_num_recvs++;
+		spdk_rdma_provider_srq_queue_recv_wrs(rdma_rsp->srq, rdma_rsp->recv_wr);
+		return 0;
+	}
 	rdma_req->completion_flags |= NVME_RDMA_RECV_COMPLETED;
 	rdma_req->rdma_rsp = rdma_rsp;
 
@@ -4053,6 +4140,8 @@ nvme_rdma_poller_destroy(struct nvme_rdma_poller *poller)
 		spdk_rdma_provider_srq_destroy(poller->srq);
 	}
 	if (poller->xrc_rsps) {
+		SPDK_NOTICELOG("XRC: host poller SRQN 0x%x destroyed: %" PRIu64 " response buffers flushed, %"
+			       PRIu64 " came back\n", poller->xrc_srqn, poller->xrc_flushed_rsps, poller->xrc_flushed_back);
 		nvme_rdma_free_rsps(poller->xrc_rsps);
 	}
 	if (poller->xrc_srq) {

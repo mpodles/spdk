@@ -37,6 +37,12 @@
  *     travel in the capsule: the INI QPs that could RDMA-READ it are not
  *     connected yet.
  *
+ * A session never recovers from a failed INI or TGT QP. The target marks it
+ * failed and rejects new queues for it; the host stops adding queues to it
+ * (after a TGT QP error, a CM reject or a changed REP) and starts a new
+ * session with a new id. Queues already on the old session keep working
+ * until they disconnect.
+ *
  * QPs connected outside RDMA-CM (target INI w <-> host TGT w) use
  * PSN = INI QPN & 0xffffff in both directions' bookkeeping.
  */
@@ -67,6 +73,14 @@ enum spdk_nvme_rdma_xrc_steering {
 	SPDK_NVME_RDMA_XRC_STEER_RANDOM	= 2,
 };
 
+/*
+ * The host already holds TGT QPs connected to this session's INI QPs. The
+ * target rejects such a request when it no longer knows the session (all its
+ * queues are gone, or the target restarted): the host then starts a new
+ * session instead of joining INI QPs it is not connected to.
+ */
+#define SPDK_NVMF_RDMA_XRC_REQ_JOIN	0x01
+
 struct __attribute__((packed)) spdk_nvmf_rdma_xrc_request_private_data {
 	/* Same first 10 bytes as spdk_nvmf_rdma_request_private_data. */
 	uint16_t	recfmt;
@@ -77,7 +91,8 @@ struct __attribute__((packed)) spdk_nvmf_rdma_xrc_request_private_data {
 	/* XRC extension, in the standard struct's reserved bytes. */
 	uint16_t	xrc_magic;
 	uint8_t		xrc_version;
-	uint8_t		reserved1;
+	/* SPDK_NVMF_RDMA_XRC_REQ_* */
+	uint8_t		flags;
 	/* SRQ of the host poller owning this queue: responses go there. */
 	uint32_t	resp_srqn;
 	uint64_t	session_id;

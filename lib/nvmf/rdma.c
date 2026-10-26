@@ -225,6 +225,9 @@ struct spdk_nvmf_rdma_recv {
 	/* The SRQ this receive is posted to, NULL without SRQ. */
 	struct spdk_rdma_provider_srq		*srq;
 
+	/* XRC: flushed by the NIC and not reposted (see nvmf_rdma_poller_poll). */
+	bool					xrc_flushed;
+
 	/* In-capsule data buffer */
 	uint8_t					*buf;
 
@@ -470,6 +473,9 @@ struct spdk_nvmf_rdma_poller_stat {
 	/* XRC: shadow qpairs created / destroyed on this poller. */
 	uint64_t				xrc_shadows_created;
 	uint64_t				xrc_shadows_destroyed;
+	/* XRC: command buffers flushed by the NIC, and those that came back. */
+	uint64_t				xrc_flushed_recvs;
+	uint64_t				xrc_flushed_back;
 };
 
 struct spdk_nvmf_rdma_poller {
@@ -744,6 +750,8 @@ struct spdk_nvmf_rdma_xrc_qpair {
 	void					*fini_cb_arg;
 	/* Below guarded by device->xrc_lock. */
 	bool					closing;
+	/* A close was requested because the session failed under it. */
+	bool					doomed;
 	bool					in_tree;
 	uint32_t				num_shadows;
 	struct spdk_nvmf_rdma_qpair		*shadows[SPDK_NVMF_RDMA_XRC_MAX_WORKERS];
@@ -1006,7 +1014,7 @@ nvmf_rdma_xrc_session_put(struct spdk_nvmf_rdma_xrc_session *session)
 static struct spdk_nvmf_rdma_xrc_session *
 nvmf_rdma_xrc_session_get(struct spdk_nvmf_rdma_transport *rtransport,
 			  struct spdk_nvmf_rdma_device *device, struct rdma_cm_event *event,
-			  uint64_t session_id)
+			  uint64_t session_id, bool join)
 {
 	struct spdk_nvmf_rdma_xrc_session *session;
 	struct spdk_nvmf_rdma_poller *poller;
@@ -1017,6 +1025,7 @@ nvmf_rdma_xrc_session_get(struct spdk_nvmf_rdma_transport *rtransport,
 	TAILQ_FOREACH(session, &device->xrc_sessions, link) {
 		if (session->id == session_id) {
 			if (session->state == NVMF_RDMA_XRC_SESSION_FAILED) {
+				SPDK_NOTICELOG("XRC: queue for failed session 0x%" PRIx64 " refused\n", session_id);
 				session = NULL;
 			} else {
 				session->refcnt++;
@@ -1024,6 +1033,13 @@ nvmf_rdma_xrc_session_get(struct spdk_nvmf_rdma_transport *rtransport,
 			pthread_mutex_unlock(&device->xrc_lock);
 			return session;
 		}
+	}
+
+	if (join) {
+		/* The host's TGT QPs point at INI QPs that are gone. */
+		pthread_mutex_unlock(&device->xrc_lock);
+		SPDK_NOTICELOG("XRC: queue joining unknown session 0x%" PRIx64 " refused\n", session_id);
+		return NULL;
 	}
 
 	session = calloc(1, sizeof(*session));
@@ -1273,12 +1289,43 @@ nvmf_rdma_poller_worker(struct spdk_nvmf_rdma_poller *rpoller)
  * yet: create the queue's shadow here, on this thread. NULL if the queue is
  * gone or closing (the command is then dropped and its buffer reposted).
  */
+struct nvmf_rdma_xrc_close_ctx {
+	struct spdk_nvmf_rdma_device	*device;
+	struct spdk_thread		*thread;
+	uint64_t			session_id;
+	uint32_t			tgt_qpn;
+	uint16_t			qid;
+};
+
+/* On the queue's home thread, where its real qpair is destroyed: look it up
+ * again, it may be gone already. */
+static void
+_nvmf_rdma_xrc_close_msg(void *arg)
+{
+	struct nvmf_rdma_xrc_close_ctx *ctx = arg;
+	struct spdk_nvmf_rdma_xrc_qpair find = {}, *real_xrc;
+	struct spdk_nvmf_rdma_qpair *real = NULL;
+
+	find.tgt_qpn = ctx->tgt_qpn;
+	pthread_mutex_lock(&ctx->device->xrc_lock);
+	real_xrc = RB_FIND(xrc_tgt_tree, &ctx->device->xrc_tgts, &find);
+	if (real_xrc != NULL && !real_xrc->closing) {
+		real = real_xrc->rqpair;
+	}
+	pthread_mutex_unlock(&ctx->device->xrc_lock);
+	if (real != NULL) {
+		spdk_nvmf_qpair_disconnect(&real->qpair);
+	}
+	free(ctx);
+}
+
 static struct spdk_nvmf_rdma_qpair *
 nvmf_rdma_xrc_shadow_get(struct spdk_nvmf_rdma_poller *rpoller, uint32_t qp_num)
 {
 	struct spdk_nvmf_rdma_device *device = rpoller->device;
 	struct spdk_nvmf_rdma_xrc_qpair find = {}, *real_xrc;
 	struct spdk_nvmf_rdma_qpair *real, *shadow = NULL;
+	struct nvmf_rdma_xrc_close_ctx *doomed = NULL;
 	struct spdk_nvmf_rdma_xrc_ini *ini;
 	uint32_t w = nvmf_rdma_poller_worker(rpoller);
 
@@ -1289,6 +1336,25 @@ nvmf_rdma_xrc_shadow_get(struct spdk_nvmf_rdma_poller *rpoller, uint32_t qp_num)
 		goto out;
 	}
 	real = real_xrc->rqpair;
+	if (real->qpair.state == SPDK_NVMF_QPAIR_ENABLED && !real_xrc->doomed &&
+	    real_xrc->home_thread != NULL &&
+	    (real_xrc->session->state == NVMF_RDMA_XRC_SESSION_FAILED ||
+	     real_xrc->session->ini[w].in_error)) {
+		/* The queue sent a command to a worker whose INI QP to its host
+		 * failed (it joined the session just before the failure, or never
+		 * used this worker until now): no response could reach the host,
+		 * so close the queue instead of dropping the command. */
+		doomed = calloc(1, sizeof(*doomed));
+		if (doomed != NULL) {
+			real_xrc->doomed = true;
+			doomed->device = device;
+			doomed->tgt_qpn = qp_num;
+			doomed->thread = real_xrc->home_thread;
+			doomed->session_id = real_xrc->session->id;
+			doomed->qid = real->qpair.qid;
+		}
+		goto out;
+	}
 	if (real->qpair.state != SPDK_NVMF_QPAIR_ENABLED || real->qpair.ctrlr == NULL ||
 	    real_xrc->session->state != NVMF_RDMA_XRC_SESSION_CONNECTED) {
 		goto out;
@@ -1335,6 +1401,11 @@ nvmf_rdma_xrc_shadow_get(struct spdk_nvmf_rdma_poller *rpoller, uint32_t qp_num)
 	real_xrc->num_shadows++;
 out:
 	pthread_mutex_unlock(&device->xrc_lock);
+	if (doomed != NULL) {
+		SPDK_NOTICELOG("XRC: qid %u (TGT 0x%x) sent a command to worker %u of failed session 0x%"
+			       PRIx64 ": closing the queue\n", doomed->qid, qp_num, w, doomed->session_id);
+		spdk_thread_send_msg(doomed->thread, _nvmf_rdma_xrc_close_msg, doomed);
+	}
 	if (shadow != NULL) {
 		RB_INSERT(qpairs_tree, &rpoller->qpairs, shadow);
 		rpoller->stat.xrc_shadows_created++;
@@ -1615,6 +1686,10 @@ nvmf_rdma_xrc_ini_failed(struct spdk_nvmf_rdma_poller *rpoller, struct spdk_nvmf
 		return;
 	}
 	ini->in_error = true;
+	/* No new queues for this session; the host starts a new one. */
+	pthread_mutex_lock(&ini->session->device->xrc_lock);
+	ini->session->state = NVMF_RDMA_XRC_SESSION_FAILED;
+	pthread_mutex_unlock(&ini->session->device->xrc_lock);
 	RB_FOREACH_SAFE(rqpair, qpairs_tree, &rpoller->qpairs, tmp) {
 		if (rqpair->sq == sq) {
 			rqpair->ibv_in_error_state = true;
@@ -2679,7 +2754,7 @@ nvmf_rdma_connect(struct spdk_nvmf_transport *transport, struct rdma_cm_event *e
 		rqpair->xrc->real = rqpair;
 		rqpair->xrc->resp_srqn = xpd->resp_srqn;
 		rqpair->xrc->session = nvmf_rdma_xrc_session_get(rtransport, port->device, event,
-				       xpd->session_id);
+				       xpd->session_id, xpd->flags & SPDK_NVMF_RDMA_XRC_REQ_JOIN);
 		if (rqpair->xrc->session == NULL) {
 			free(rqpair->xrc);
 			free(rqpair);
@@ -3739,6 +3814,8 @@ nvmf_rdma_request_process(struct spdk_nvmf_rdma_transport *rtransport,
 					rsp->status.sct = SPDK_NVME_SCT_GENERIC;
 					rsp->status.sc = SPDK_NVME_SC_INVALID_FIELD;
 					rsp->status.dnr = 1;
+					/* Answered here, not by the generic layer: fill the CID. */
+					rsp->cid = rdma_req->req.cmd->nvme_cmd.cid;
 					STAILQ_INSERT_TAIL(&rqpair->sq->pending_rdma_send_queue, rdma_req, state_link);
 					rdma_req->state = RDMA_REQUEST_STATE_READY_TO_COMPLETE_PENDING;
 					break;
@@ -5255,6 +5332,29 @@ nvmf_rdma_disconnect(struct rdma_cm_event *evt, bool *event_acked)
 	return 0;
 }
 
+/*
+ * XRC: the host gave up on a queue after our CM REP (it rejects a REP whose
+ * topology it does not expect, or never sends RTU). Nothing else would ever
+ * close that queue. RC queues keep the stock behaviour.
+ */
+static void
+nvmf_rdma_xrc_cm_failed(struct rdma_cm_event *event, bool *event_acked)
+{
+	struct spdk_nvmf_rdma_qpair *rqpair;
+
+	if (event->id == NULL || event->id->context == NULL) {
+		return;
+	}
+	/* REP was sent, so the context is the queue (see nvmf_rdma_connect). */
+	rqpair = SPDK_CONTAINEROF(event->id->context, struct spdk_nvmf_rdma_qpair, qpair);
+	if (rqpair->xrc == NULL) {
+		return;
+	}
+	SPDK_NOTICELOG("XRC: host abandoned queue qid %u (TGT QP 0x%x) during connect: %s\n",
+		       rqpair->qpair.qid, rqpair->qp_num, rdma_event_str(event->event));
+	nvmf_rdma_disconnect(event, event_acked);
+}
+
 #ifdef DEBUG
 static const char *CM_EVENT_STR[] = {
 	"RDMA_CM_EVENT_ADDR_RESOLVED",
@@ -5433,10 +5533,12 @@ nvmf_process_cm_events(struct spdk_nvmf_transport *transport, uint32_t max_event
 			break;
 		case RDMA_CM_EVENT_CONNECT_ERROR:
 			/* Can this happen? The docs say it can, but not sure what causes it. */
+			nvmf_rdma_xrc_cm_failed(event, &event_acked);
 			break;
 		case RDMA_CM_EVENT_UNREACHABLE:
 		case RDMA_CM_EVENT_REJECTED:
 			/* These only occur on the client side. */
+			nvmf_rdma_xrc_cm_failed(event, &event_acked);
 			break;
 		case RDMA_CM_EVENT_ESTABLISHED:
 			/* TODO: Should we be waiting for this event anywhere? */
@@ -6685,6 +6787,26 @@ nvmf_rdma_poller_poll(struct spdk_nvmf_rdma_transport *rtransport,
 			/* rdma_recv->qpair will be invalid if using an SRQ.  In that case we have to get the qpair from the wc. */
 			rdma_recv = SPDK_CONTAINEROF(rdma_wr, struct spdk_nvmf_rdma_recv, rdma_wr);
 			if (rdma_recv->srq != NULL && rdma_recv->srq == rpoller->xrc_srq) {
+				if (spdk_unlikely(wc[i].status)) {
+					/*
+					 * A TGT QP went to error (its queue closed) and the NIC
+					 * flushed SRQ buffers with it. On CX7 (fw 28.48)
+					 * reposting them puts a buffer in the SRQ twice, so two
+					 * commands land in one buffer. Leave them out; one the
+					 * NIC still holds comes back with a good completion.
+					 */
+					if (!rdma_recv->xrc_flushed) {
+						rdma_recv->xrc_flushed = true;
+						rpoller->stat.xrc_flushed_recvs++;
+					}
+					SPDK_DEBUGLOG(rdma, "XRC: command buffer flushed (TGT QP 0x%x, %s)\n",
+						      wc[i].qp_num, ibv_wc_status_str(wc[i].status));
+					continue;
+				}
+				if (spdk_unlikely(rdma_recv->xrc_flushed)) {
+					rdma_recv->xrc_flushed = false;
+					rpoller->stat.xrc_flushed_back++;
+				}
 				/* XRC: wc.qp_num is the TGT QP, i.e. the host queue. */
 				rdma_recv->qpair = get_rdma_qpair_from_wc(rpoller, &wc[i]);
 				if (rdma_recv->qpair == NULL && spdk_likely(!wc[i].status)) {
@@ -7210,6 +7332,8 @@ nvmf_rdma_xrc_dump_poller(struct spdk_nvmf_rdma_poller *rpoller, struct spdk_jso
 	spdk_json_write_named_uint64(w, "orphan_recvs", rpoller->stat.xrc_orphan_recvs);
 	spdk_json_write_named_uint64(w, "shadows_created", rpoller->stat.xrc_shadows_created);
 	spdk_json_write_named_uint64(w, "shadows_destroyed", rpoller->stat.xrc_shadows_destroyed);
+	spdk_json_write_named_uint64(w, "flushed_recvs", rpoller->stat.xrc_flushed_recvs);
+	spdk_json_write_named_uint64(w, "flushed_back", rpoller->stat.xrc_flushed_back);
 
 	spdk_json_write_named_array_begin(w, "ini_qps");
 	pthread_mutex_lock(&device->xrc_lock);
