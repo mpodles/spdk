@@ -976,6 +976,8 @@ spdk_nvme_transport_get_opts(struct spdk_nvme_transport_opts *opts, size_t opts_
 	SET_FIELD(rdma_cm_event_timeout_ms);
 	SET_FIELD(rdma_umr_per_io);
 	SET_FIELD(tcp_connect_timeout_ms);
+	SET_FIELD(rdma_xrc);
+	SET_FIELD(rdma_xrc_steering);
 
 	/* Do not remove this statement, you should always update this statement when you adding a new field,
 	 * and do not forget to add the SET_FIELD statement for your added field. */
@@ -1009,6 +1011,8 @@ spdk_nvme_transport_set_opts(const struct spdk_nvme_transport_opts *opts, size_t
 	SET_FIELD(rdma_cm_event_timeout_ms);
 	SET_FIELD(rdma_umr_per_io);
 	SET_FIELD(tcp_connect_timeout_ms);
+	SET_FIELD(rdma_xrc);
+	SET_FIELD(rdma_xrc_steering);
 
 	if (g_spdk_nvme_transport_opts.tcp_connect_timeout_ms > INT_MAX) {
 		SPDK_ERRLOG("tcp_connect_timeout_ms opt cannot exceed INT_MAX\n");

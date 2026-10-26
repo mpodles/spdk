@@ -28,6 +28,7 @@
 #include "spdk/nvmf.h"
 #include "spdk/keyring.h"
 #include "spdk/module/keyring/file.h"
+#include "spdk_internal/nvmf_rdma_xrc.h"
 
 #ifdef SPDK_CONFIG_URING
 #include <liburing.h>
@@ -282,6 +283,8 @@ static char *g_sock_threshold_impl;
 static uint8_t g_transport_tos = 0;
 
 static uint32_t g_rdma_srq_size;
+static bool g_rdma_xrc;
+static int g_rdma_xrc_steering = -1;
 static struct spdk_key *g_psk = NULL;
 
 /* Burst experiment parameters */
@@ -2323,6 +2326,8 @@ usage(char *program_name)
 	printf("==== RDMA OPTIONS ====\n\n");
 	printf("\t--transport-tos <val> specify the type of service for RDMA transport. Default: 0 (disabled)\n");
 	printf("\t--rdma-srq-size <val> The size of a shared rdma receive queue. Default: 0 (disabled)\n");
+	printf("\t--rdma-xrc           I/O queues over XRC (target needs the RDMA transport option xrc)\n");
+	printf("\t--rdma-xrc-steering <home|rr|random> target poll group per command. Default: home\n");
 	printf("\t-k, --keepalive <ms> keep alive timeout period in millisecond\n");
 	printf("\n");
 
@@ -2814,6 +2819,10 @@ static const struct option g_perf_cmdline_opts[] = {
 	{"transport-tos", required_argument, NULL, PERF_TRANSPORT_TOS},
 #define PERF_RDMA_SRQ_SIZE	268
 	{"rdma-srq-size", required_argument, NULL, PERF_RDMA_SRQ_SIZE},
+#define PERF_RDMA_XRC		277
+	{"rdma-xrc", no_argument, NULL, PERF_RDMA_XRC},
+#define PERF_RDMA_XRC_STEERING	278
+	{"rdma-xrc-steering", required_argument, NULL, PERF_RDMA_XRC_STEERING},
 #define PERF_USE_EVERY_CORE	269
 	{"use-every-core", no_argument, NULL, PERF_USE_EVERY_CORE},
 #define PERF_NO_HUGE		270
@@ -2848,6 +2857,21 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 
 	while ((op = getopt_long(argc, argv, PERF_GETOPT_SHORT, g_perf_cmdline_opts, &long_idx)) != -1) {
 		switch (op) {
+		case PERF_RDMA_XRC:
+			g_rdma_xrc = true;
+			break;
+		case PERF_RDMA_XRC_STEERING:
+			if (strcmp(optarg, "home") == 0) {
+				g_rdma_xrc_steering = SPDK_NVME_RDMA_XRC_STEER_HOME;
+			} else if (strcmp(optarg, "rr") == 0) {
+				g_rdma_xrc_steering = SPDK_NVME_RDMA_XRC_STEER_RR;
+			} else if (strcmp(optarg, "random") == 0) {
+				g_rdma_xrc_steering = SPDK_NVME_RDMA_XRC_STEER_RANDOM;
+			} else {
+				fprintf(stderr, "Unknown --rdma-xrc-steering %s\n", optarg);
+				return 1;
+			}
+			break;
 		case PERF_WARMUP_TIME:
 		case PERF_SHMEM_GROUP_ID:
 		case PERF_MAX_COMPLETIONS_PER_POLL:
@@ -3256,11 +3280,18 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 		return 1;
 	}
 
-	if (g_rdma_srq_size != 0) {
+	if (g_rdma_srq_size != 0 || g_rdma_xrc) {
 		struct spdk_nvme_transport_opts opts;
 
 		spdk_nvme_transport_get_opts(&opts, sizeof(opts));
-		opts.rdma_srq_size = g_rdma_srq_size;
+		if (g_rdma_srq_size != 0) {
+			opts.rdma_srq_size = g_rdma_srq_size;
+		}
+		if (g_rdma_xrc) {
+			opts.rdma_xrc = true;
+			opts.rdma_xrc_steering = g_rdma_xrc_steering < 0 ? SPDK_NVME_RDMA_XRC_STEER_HOME :
+						 g_rdma_xrc_steering;
+		}
 
 		rc = spdk_nvme_transport_set_opts(&opts, sizeof(opts));
 		if (rc != 0) {

@@ -4953,8 +4953,26 @@ struct spdk_nvme_transport_opts {
 	 */
 	bool use_poll_group_process_events;
 
-	/* Hole at bytes 12-15. */
-	uint8_t reserved12[3];
+	/**
+	 * It is used for RDMA transport.
+	 *
+	 * I/O queues use XRC (commands of one queue may run on any target poll
+	 * group). Needs a target with the "xrc" RDMA transport option, I/O
+	 * qpairs in a poll group, and in-capsule data of at least 1024 bytes.
+	 * The admin queue stays RC.
+	 */
+	bool rdma_xrc;
+
+	/**
+	 * It is used for RDMA transport with rdma_xrc.
+	 *
+	 * Which target poll group gets each command, enum
+	 * spdk_nvme_rdma_xrc_steering: 0 home, 1 round-robin per queue, 2 random.
+	 */
+	uint8_t rdma_xrc_steering;
+
+	/* Hole at byte 15. */
+	uint8_t reserved14;
 
 	/**
 	 * The size of spdk_nvme_transport_opts according to the caller of this library is used for ABI
