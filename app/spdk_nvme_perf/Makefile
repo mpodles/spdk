@@ -11,6 +11,12 @@ include $(SPDK_ROOT_DIR)/mk/spdk.modules.mk
 APP = spdk_nvme_perf
 
 C_SRCS := perf.c
+# Open-loop traffic (--traffic): korba's traffic engine, header-only C++ in the
+# main repo (subprojects/korba/src), wrapped by traffic_shim.cpp.
+CXX_SRCS := traffic_shim.cpp
+KORBA_SRC ?= $(SPDK_ROOT_DIR)/../korba/src
+CXXFLAGS += -std=c++17 -I$(KORBA_SRC)
+SYS_LIBS += -lstdc++
 
 SPDK_LIB_LIST += $(SOCK_MODULES_LIST) nvme vmd keyring_file
 

@@ -29,6 +29,7 @@
 #include "spdk/keyring.h"
 #include "spdk/module/keyring/file.h"
 #include "spdk_internal/nvmf_rdma_xrc.h"
+#include "traffic_shim.h"
 
 #ifdef SPDK_CONFIG_URING
 #include <liburing.h>
@@ -141,6 +142,9 @@ struct ns_worker_ctx {
 	uint64_t		tsc_next_io;    /* earliest TSC for next submit (rate limiting) */
 	TAILQ_HEAD(, perf_task)	idle_tasks;     /* tasks parked while inactive or rate-limited */
 
+	/* Open-loop traffic (--traffic): the owning core's state, NULL otherwise */
+	struct traffic_core	*tc;
+
 	union {
 		struct {
 			int				num_active_qpairs;
@@ -185,6 +189,8 @@ struct perf_task {
 	uint64_t		submit_tsc;
 	bool			is_read;
 	int			qp_idx;   /* QP index used for this task; set by submit_single_io */
+	uint64_t		sched_tsc; /* --traffic: when the command was due */
+	uint32_t		tq;        /* --traffic: queue index within its core */
 	struct spdk_dif_ctx	dif_ctx;
 #if HAVE_LIBAIO
 	struct iocb		iocb;
@@ -197,7 +203,58 @@ struct worker_thread {
 	TAILQ_HEAD(, ns_worker_ctx)	ns_ctx;
 	TAILQ_ENTRY(worker_thread)	link;
 	unsigned			lcore;
+	uint32_t			index;	/* position in g_workers */
+	struct traffic_core		*tc;	/* --traffic only */
 };
+
+/*
+ * Open-loop traffic (--traffic, docs/investigations/nvmeof_xrc_traffic.md in
+ * the main repo). Each core runs korba's traffic engine over its queues (every
+ * I/O qpair of every namespace it drives). A command is sent when the engine
+ * says it is due, on exactly the queue it names. A queue holds at most -q
+ * commands in flight; a command that finds its queue full (or no free task)
+ * waits in that queue's backlog, oldest first, and is dropped when the backlog
+ * is full. Latency is measured from the scheduled time, so waiting counts.
+ */
+struct traffic_queue {
+	struct ns_worker_ctx	*ns_ctx;
+	int			qp_idx;
+	uint32_t		inflight;
+	uint32_t		head;	/* backlog ring: the oldest at head */
+	uint32_t		count;
+	uint64_t		*ring;	/* g_traffic_backlog scheduled times, allocated on first use */
+	bool			in_ready;
+};
+
+struct traffic_core {
+	struct perf_traffic	*engine;
+	uint32_t		nq;
+	struct traffic_queue	*q;
+	uint32_t		*global_ids;
+	TAILQ_HEAD(, perf_task)	free_tasks;
+	uint32_t		tasks;		/* allocated so far, at most g_traffic_pool */
+	uint32_t		*ready;		/* ring of queues that wait only for a free task */
+	uint32_t		ready_head;
+	uint32_t		ready_count;
+	struct spdk_histogram_data *hist_sched;	/* completion - scheduled time */
+	struct spdk_histogram_data *hist_svc;	/* completion - submit */
+	uint64_t		arrivals;
+	uint64_t		posted;
+	uint64_t		completed;
+	uint64_t		waited;
+	uint64_t		dropped;
+	uint64_t		errors;
+	uint32_t		backlog_max;
+};
+
+static char *g_traffic_spec = NULL;
+static bool g_traffic_bursty = false;
+static uint64_t g_traffic_rate = 0;		/* per core, fixed: specs */
+static uint64_t g_workload_seed = 1;
+static uint32_t g_traffic_backlog = 1024;	/* per queue */
+static uint32_t g_traffic_pool = 16384;		/* tasks per core */
+static uint32_t g_traffic_total_queues = 0;
+static uint64_t g_tsc_launch = 0;		/* workers launched; for QUEUES_CONNECTED_S */
 
 struct ns_fn_table {
 	void	(*setup_payload)(struct perf_task *task, uint8_t pattern);
@@ -982,8 +1039,8 @@ nvme_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
 		}
 	}
 
-	if (g_burst_pct > 0) {
-		/* QP was already selected and recorded by submit_single_io */
+	if (g_burst_pct > 0 || g_traffic_spec != NULL) {
+		/* QP was already selected and recorded by submit_single_io / traffic_send */
 		qp_num = task->qp_idx;
 	} else {
 		qp_num = ns_ctx->u.nvme.last_qpair;
@@ -1401,7 +1458,8 @@ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 	entry->fn_table = &nvme_fn_table;
 	entry->u.nvme.ctrlr = ctrlr;
 	entry->u.nvme.ns = ns;
-	entry->num_io_requests = entries * spdk_divide_round_up(g_queue_depth, g_nr_io_queues_per_ns);
+	entry->num_io_requests = entries * (g_traffic_spec != NULL ? (uint32_t)g_queue_depth :
+					    spdk_divide_round_up(g_queue_depth, g_nr_io_queues_per_ns));
 
 	entry->size_in_ios = ns_size / g_io_size_bytes;
 	entry->io_size_blocks = g_io_size_bytes / sector_size;
@@ -1645,6 +1703,8 @@ submit_single_io(struct perf_task *task)
 	}
 }
 
+static void traffic_complete(struct perf_task *task);
+
 static inline void
 task_complete(struct perf_task *task)
 {
@@ -1708,6 +1768,8 @@ task_complete(struct perf_task *task)
 			spdk_dma_free(task->md_iov.iov_base);
 		}
 		free(task);
+	} else if (ns_ctx->tc != NULL) {
+		traffic_complete(task);
 	} else if (g_total_iops > 0 && spdk_get_ticks() < ns_ctx->tsc_next_io) {
 		/* Rate limit not yet reached — defer */
 		TAILQ_INSERT_TAIL(&ns_ctx->idle_tasks, task, link);
@@ -1791,6 +1853,438 @@ submit_io(struct ns_worker_ctx *ns_ctx, int queue_depth)
 		task = allocate_task(ns_ctx, queue_depth);
 		submit_single_io(task);
 	}
+}
+
+
+/* ---- --traffic: open-loop sending (struct traffic_core) ---- */
+
+static struct perf_task *
+traffic_get_task(struct traffic_core *tc, struct ns_worker_ctx *ns_ctx)
+{
+	struct perf_task *task = TAILQ_FIRST(&tc->free_tasks);
+
+	if (task != NULL) {
+		TAILQ_REMOVE(&tc->free_tasks, task, link);
+		return task;
+	}
+	if (tc->tasks >= g_traffic_pool) {
+		return NULL;
+	}
+	tc->tasks++;
+	/* Every namespace has the same block and metadata size (checked in
+	 * traffic_setup), so a task's buffers fit any of the core's queues. */
+	return allocate_task(ns_ctx, (int)tc->tasks);
+}
+
+static void
+traffic_send(struct traffic_core *tc, uint32_t qi, uint64_t sched, struct perf_task *task)
+{
+	struct traffic_queue	*q = &tc->q[qi];
+	struct ns_worker_ctx	*ns_ctx = q->ns_ctx;
+	struct ns_entry		*entry = ns_ctx->entry;
+	uint64_t		offset_in_ios;
+	int			rc;
+
+	task->ns_ctx = ns_ctx;
+	task->qp_idx = q->qp_idx;
+	task->tq = qi;
+	task->sched_tsc = sched;
+
+	if (entry->zipf) {
+		offset_in_ios = spdk_zipf_generate(entry->zipf);
+	} else if (g_is_random) {
+		offset_in_ios = spdk_rand_xorshift64(&entry->seed) % entry->size_in_ios;
+	} else {
+		offset_in_ios = ns_ctx->offset_in_ios++;
+		if (ns_ctx->offset_in_ios == entry->size_in_ios) {
+			ns_ctx->offset_in_ios = 0;
+		}
+	}
+	task->is_read = (g_rw_percentage == 100) ||
+			(g_rw_percentage != 0 &&
+			 ((spdk_rand_xorshift64(&entry->seed) % 100) < (uint64_t)g_rw_percentage));
+	task->submit_tsc = spdk_get_ticks();
+
+	rc = entry->fn_table->submit_io(task, ns_ctx, entry, offset_in_ios);
+	if (spdk_unlikely(rc != 0)) {
+		RATELIMIT_LOG("traffic: starting I/O failed: %d\n", rc);
+		tc->errors++;
+		TAILQ_INSERT_HEAD(&tc->free_tasks, task, link);
+		return;
+	}
+	q->inflight++;
+	ns_ctx->current_queue_depth++;
+	ns_ctx->stats.io_submitted++;
+	tc->posted++;
+}
+
+static void
+traffic_ready_push(struct traffic_core *tc, uint32_t qi)
+{
+	if (tc->q[qi].in_ready) {
+		return;
+	}
+	tc->q[qi].in_ready = true;
+	tc->ready[(tc->ready_head + tc->ready_count) % tc->nq] = qi;
+	tc->ready_count++;
+}
+
+static void
+traffic_backlog_push(struct traffic_core *tc, uint32_t qi, uint64_t sched)
+{
+	struct traffic_queue *q = &tc->q[qi];
+
+	if (q->count >= g_traffic_backlog) {
+		tc->dropped++;
+		return;
+	}
+	if (q->ring == NULL) {
+		q->ring = malloc(sizeof(uint64_t) * g_traffic_backlog);
+		if (q->ring == NULL) {
+			tc->dropped++;
+			return;
+		}
+	}
+	q->ring[(q->head + q->count) % g_traffic_backlog] = sched;
+	q->count++;
+	tc->waited++;
+	if (q->count > tc->backlog_max) {
+		tc->backlog_max = q->count;
+	}
+}
+
+/* Queues that have a free slot and a backlog get the free tasks, in turn. */
+static void
+traffic_serve(struct traffic_core *tc)
+{
+	struct traffic_queue	*q;
+	struct perf_task	*task;
+	uint64_t		sched;
+	uint32_t		qi;
+
+	while (tc->ready_count > 0) {
+		qi = tc->ready[tc->ready_head];
+		q = &tc->q[qi];
+		if (q->count == 0 || q->inflight >= (uint32_t)g_queue_depth || q->ns_ctx->is_draining) {
+			tc->ready_head = (tc->ready_head + 1) % tc->nq;
+			tc->ready_count--;
+			q->in_ready = false;
+			continue;
+		}
+		task = traffic_get_task(tc, q->ns_ctx);
+		if (task == NULL) {
+			return;
+		}
+		tc->ready_head = (tc->ready_head + 1) % tc->nq;
+		tc->ready_count--;
+		q->in_ready = false;
+		sched = q->ring[q->head];
+		q->head = (q->head + 1) % g_traffic_backlog;
+		q->count--;
+		traffic_send(tc, qi, sched, task);
+		if (q->count > 0 && q->inflight < (uint32_t)g_queue_depth) {
+			traffic_ready_push(tc, qi);
+		}
+	}
+}
+
+static void
+traffic_arrival(struct traffic_core *tc, uint32_t qi, uint64_t sched)
+{
+	struct traffic_queue	*q = &tc->q[qi];
+	struct perf_task	*task;
+
+	tc->arrivals++;
+	if (q->ns_ctx->is_draining) {
+		return;
+	}
+	if (q->count == 0 && q->inflight < (uint32_t)g_queue_depth) {
+		task = traffic_get_task(tc, q->ns_ctx);
+		if (task != NULL) {
+			traffic_send(tc, qi, sched, task);
+			return;
+		}
+		/* The queue has room but the core has no free task. */
+		traffic_backlog_push(tc, qi, sched);
+		traffic_ready_push(tc, qi);
+		return;
+	}
+	traffic_backlog_push(tc, qi, sched);
+}
+
+static void
+traffic_complete(struct perf_task *task)
+{
+	struct traffic_core	*tc = task->ns_ctx->tc;
+	struct traffic_queue	*q = &tc->q[task->tq];
+	uint64_t		now = spdk_get_ticks();
+
+	spdk_histogram_data_tally(tc->hist_sched, now - task->sched_tsc);
+	spdk_histogram_data_tally(tc->hist_svc, now - task->submit_tsc);
+	tc->completed++;
+	q->inflight--;
+	TAILQ_INSERT_HEAD(&tc->free_tasks, task, link);
+	if (q->count > 0) {
+		traffic_ready_push(tc, task->tq);
+	}
+	traffic_serve(tc);
+}
+
+/* Hands out every arrival due by now (bounded, so completions get polled). */
+static void
+traffic_poll_core(struct traffic_core *tc)
+{
+	uint64_t	sched[64];
+	uint32_t	qs[64];
+	uint32_t	got, i, rounds = 0;
+
+	do {
+		got = perf_traffic_poll(tc->engine, spdk_get_ticks(), sched, qs, 64);
+		for (i = 0; i < got; i++) {
+			traffic_arrival(tc, qs[i], sched[i]);
+		}
+	} while (got == 64 && ++rounds < 16);
+}
+
+static void
+traffic_reset_stats(struct traffic_core *tc)
+{
+	tc->arrivals = 0;
+	tc->posted = 0;
+	tc->completed = 0;
+	tc->waited = 0;
+	tc->dropped = 0;
+	tc->errors = 0;
+	tc->backlog_max = 0;
+	spdk_histogram_data_reset(tc->hist_sched);
+	spdk_histogram_data_reset(tc->hist_svc);
+}
+
+static int
+traffic_client_of(const struct ns_entry *entry)
+{
+	const struct ns_entry *e;
+	int i = 0;
+
+	TAILQ_FOREACH(e, &g_namespaces, link) {
+		if (e == entry) {
+			return i;
+		}
+		i++;
+	}
+	return -1;
+}
+
+static uint64_t
+traffic_core_seed(const struct worker_thread *worker)
+{
+	/* bursty: every core seeds each queue from the Workload seed and the
+	 * queue's global index; fixed: a distinct stream per core (as korba). */
+	if (g_traffic_bursty) {
+		return g_workload_seed;
+	}
+	return g_workload_seed ^ ((uint64_t)worker->index * 0x9E3779B97F4A7C15ULL + 1);
+}
+
+/*
+ * Builds every core's queue list and the queues' global indexes, in the main
+ * thread before the workers start. A namespace is a Client (one controller,
+ * one host session); global index = the Client's base + the queue's position
+ * among that Client's queues in core order. Then tries each core's engine once,
+ * so a spec that does not fit fails here, not in a worker.
+ */
+static int
+traffic_setup(void)
+{
+	struct worker_thread	*worker;
+	struct ns_worker_ctx	*ns_ctx;
+	struct ns_entry		*entry, *first = TAILQ_FIRST(&g_namespaces);
+	uint32_t		*per_client, *base, *next;
+	uint32_t		idx = 0, total = 0, k, i;
+	int			c, nclients = g_num_namespaces, rc = 0;
+	char			err[512];
+
+	TAILQ_FOREACH(entry, &g_namespaces, link) {
+		if (entry->type != ENTRY_TYPE_NVME_NS) {
+			fprintf(stderr, "--traffic needs NVMe namespaces (not AIO/uring files)\n");
+			return -1;
+		}
+		if (entry->io_size_blocks != first->io_size_blocks || entry->md_size != first->md_size ||
+		    entry->block_size != first->block_size) {
+			fprintf(stderr, "--traffic needs every namespace to have the same block and "
+				"metadata size\n");
+			return -1;
+		}
+	}
+
+	per_client = calloc(nclients, sizeof(uint32_t));
+	base = calloc(nclients, sizeof(uint32_t));
+	next = calloc(nclients, sizeof(uint32_t));
+	if (!per_client || !base || !next) {
+		rc = -ENOMEM;
+		goto out;
+	}
+
+	TAILQ_FOREACH(worker, &g_workers, link) {
+		worker->index = idx++;
+		TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
+			c = traffic_client_of(ns_ctx->entry);
+			per_client[c] += g_nr_io_queues_per_ns;
+			total += g_nr_io_queues_per_ns;
+		}
+	}
+	for (c = 1; c < nclients; c++) {
+		base[c] = base[c - 1] + per_client[c - 1];
+	}
+	g_traffic_total_queues = total;
+
+	TAILQ_FOREACH(worker, &g_workers, link) {
+		struct traffic_core *tc = calloc(1, sizeof(*tc));
+		uint32_t nq = 0;
+
+		if (tc == NULL) {
+			rc = -ENOMEM;
+			goto out;
+		}
+		worker->tc = tc;
+		TAILQ_INIT(&tc->free_tasks);
+		TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
+			nq += g_nr_io_queues_per_ns;
+		}
+		tc->nq = nq;
+		tc->q = calloc(nq ? nq : 1, sizeof(*tc->q));
+		tc->global_ids = calloc(nq ? nq : 1, sizeof(uint32_t));
+		tc->ready = calloc(nq ? nq : 1, sizeof(uint32_t));
+		tc->hist_sched = spdk_histogram_data_alloc();
+		tc->hist_svc = spdk_histogram_data_alloc();
+		if (!tc->q || !tc->global_ids || !tc->ready || !tc->hist_sched || !tc->hist_svc) {
+			rc = -ENOMEM;
+			goto out;
+		}
+		k = 0;
+		TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
+			ns_ctx->tc = tc;
+			c = traffic_client_of(ns_ctx->entry);
+			for (i = 0; i < (uint32_t)g_nr_io_queues_per_ns; i++, k++) {
+				tc->q[k].ns_ctx = ns_ctx;
+				tc->q[k].qp_idx = (int)i;
+				tc->global_ids[k] = base[c] + next[c]++;
+			}
+		}
+		if (nq == 0) {
+			continue;
+		}
+		tc->engine = perf_traffic_create(g_traffic_spec, tc->global_ids, nq, total, g_traffic_rate,
+						 g_tsc_rate, 0, traffic_core_seed(worker), err, sizeof(err));
+		if (tc->engine == NULL) {
+			fprintf(stderr, "--traffic %s on core %u: %s\n", g_traffic_spec, worker->lcore, err);
+			rc = -EINVAL;
+			goto out;
+		}
+		if (worker->index == 0) {
+			char canon[512];
+
+			perf_traffic_format(tc->engine, canon, sizeof(canon));
+			printf("TRAFFIC spec=%s clients=%d queues=%u cores=%u offered=%.0f%s\n", canon,
+			       nclients, total, g_num_workers,
+			       g_traffic_bursty ? perf_traffic_offered(tc->engine) :
+			       (double)g_traffic_rate * g_num_workers,
+			       g_traffic_bursty ? " (all cores)" : " (rate x cores)");
+		}
+		perf_traffic_destroy(tc->engine);
+		tc->engine = NULL;
+	}
+out:
+	free(per_client);
+	free(base);
+	free(next);
+	return rc;
+}
+
+struct traffic_pct_ctx {
+	const double	*cut;
+	double		*out;
+	int		n;
+	int		i;
+};
+
+static void
+traffic_pct_cb(void *ctx, uint64_t start, uint64_t end, uint64_t count, uint64_t total,
+	       uint64_t so_far)
+{
+	struct traffic_pct_ctx *p = ctx;
+
+	if (count == 0) {
+		return;
+	}
+	while (p->i < p->n && (double)so_far / total >= p->cut[p->i]) {
+		p->out[p->i++] = (double)end * 1000 * 1000 / g_tsc_rate;
+	}
+}
+
+static void
+traffic_print(void)
+{
+	static const double cut[] = {0.5, 0.9, 0.99, 0.999, 0.9999};
+	static const char *name[] = {"P50", "P90", "P99", "P999", "P9999"};
+	struct spdk_histogram_data *hs = spdk_histogram_data_alloc();
+	struct spdk_histogram_data *hv = spdk_histogram_data_alloc();
+	struct worker_thread *worker;
+	uint64_t arrivals = 0, posted = 0, completed = 0, waited = 0, dropped = 0, errors = 0;
+	uint32_t backlog_max = 0, tasks_max = 0;
+	double secs = (double)g_elapsed_time_in_usec / 1e6, offered = 0;
+	double ps[5] = {0}, pv[5] = {0};
+	struct traffic_pct_ctx ctx;
+	int i;
+
+	if (hs == NULL || hv == NULL || secs <= 0) {
+		return;
+	}
+	TAILQ_FOREACH(worker, &g_workers, link) {
+		struct traffic_core *tc = worker->tc;
+
+		if (tc == NULL) {
+			continue;
+		}
+		arrivals += tc->arrivals;
+		posted += tc->posted;
+		completed += tc->completed;
+		waited += tc->waited;
+		dropped += tc->dropped;
+		errors += tc->errors;
+		backlog_max = spdk_max(backlog_max, tc->backlog_max);
+		tasks_max = spdk_max(tasks_max, tc->tasks);
+		if (tc->engine != NULL) {
+			offered = g_traffic_bursty ? perf_traffic_offered(tc->engine) :
+				  offered + perf_traffic_offered(tc->engine);
+		}
+		spdk_histogram_data_merge(hs, tc->hist_sched);
+		spdk_histogram_data_merge(hv, tc->hist_svc);
+	}
+	ctx = (struct traffic_pct_ctx) { cut, ps, 5, 0 };
+	spdk_histogram_data_iterate(hs, traffic_pct_cb, &ctx);
+	ctx = (struct traffic_pct_ctx) { cut, pv, 5, 0 };
+	spdk_histogram_data_iterate(hv, traffic_pct_cb, &ctx);
+
+	printf("TRAFFIC_RESULT OFFERED_IOPS %.0f\n", offered);
+	printf("TRAFFIC_RESULT ARRIVAL_IOPS %.0f\n", arrivals / secs);
+	printf("TRAFFIC_RESULT POSTED_IOPS %.0f\n", posted / secs);
+	printf("TRAFFIC_RESULT COMPLETED_IOPS %.0f\n", completed / secs);
+	printf("TRAFFIC_RESULT WAITED_PCT %.4f\n", arrivals ? 100.0 * waited / arrivals : 0.0);
+	printf("TRAFFIC_RESULT DROPPED_PCT %.4f\n", arrivals ? 100.0 * dropped / arrivals : 0.0);
+	printf("TRAFFIC_RESULT BACKLOG_MAX %u\n", backlog_max);
+	printf("TRAFFIC_RESULT TASKS_MAX %u\n", tasks_max);
+	printf("TRAFFIC_RESULT SUBMIT_ERRORS %" PRIu64 "\n", errors);
+	printf("TRAFFIC_RESULT QUEUES %u\n", g_traffic_total_queues);
+	printf("TRAFFIC_RESULT CLIENTS %d\n", g_num_namespaces);
+	for (i = 0; i < 5; i++) {
+		printf("TRAFFIC_RESULT %s_SCHED_US %.3f\n", name[i], ps[i]);
+	}
+	for (i = 0; i < 5; i++) {
+		printf("TRAFFIC_RESULT %s_SVC_US %.3f\n", name[i], pv[i]);
+	}
+	spdk_histogram_data_free(hs);
+	spdk_histogram_data_free(hv);
 }
 
 static int
@@ -2040,6 +2534,12 @@ work_fn(void *arg)
 		ns_ctx->status = 1;
 		return 1;
 	}
+	if (worker->lcore == g_main_core) {
+		/* Every worker has connected all its I/O queues. */
+		printf("QUEUES_CONNECTED_S %.3f\n",
+		       (double)(spdk_get_ticks() - g_tsc_launch) / spdk_get_ticks_hz());
+		fflush(stdout);
+	}
 
 	tsc_start = spdk_get_ticks();
 	tsc_current = tsc_start;
@@ -2059,13 +2559,30 @@ work_fn(void *arg)
 		g_tsc_next_burst = tsc_current + g_burst_interval_tsc;
 	}
 
-	/* Submit initial I/O for each namespace. */
-	TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
-		submit_io(ns_ctx, g_queue_depth);
+	if (worker->tc != NULL && worker->tc->nq > 0) {
+		char err[512];
+
+		worker->tc->engine = perf_traffic_create(g_traffic_spec, worker->tc->global_ids,
+				     worker->tc->nq, g_traffic_total_queues, g_traffic_rate,
+				     g_tsc_rate, tsc_current, traffic_core_seed(worker),
+				     err, sizeof(err));
+		if (worker->tc->engine == NULL) {
+			fprintf(stderr, "--traffic on core %u: %s\n", worker->lcore, err);
+			g_exit = true;
+		}
+	} else if (worker->tc == NULL) {
+		/* Submit initial I/O for each namespace. */
+		TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
+			submit_io(ns_ctx, g_queue_depth);
+		}
 	}
 
 	while (spdk_likely(!g_exit)) {
 		bool all_draining = true;
+
+		if (worker->tc != NULL && worker->tc->engine != NULL) {
+			traffic_poll_core(worker->tc);
+		}
 
 		/*
 		 * Check for completed I/O for each controller. A new
@@ -2156,6 +2673,9 @@ work_fn(void *arg)
 					memset(&ns_ctx->stats, 0, sizeof(ns_ctx->stats));
 					ns_ctx->stats.min_tsc = UINT64_MAX;
 					spdk_histogram_data_reset(ns_ctx->histogram);
+				}
+				if (worker->tc != NULL) {
+					traffic_reset_stats(worker->tc);
 				}
 
 				if (worker->lcore == g_main_core && isatty(STDOUT_FILENO)) {
@@ -2342,6 +2862,12 @@ usage(char *program_name)
 	printf("\t                         total system IOPS = total-iops * num_active_ctxs\n");
 	printf("\t--burst-pct <1-100>      percentage of ns_worker_ctxs active at any time (0 = disabled, default: 0)\n");
 	printf("\t--burst-interval <sec>   seconds between burst picker firings (default: 1)\n");
+	printf("\t--traffic <spec>         open loop: korba's Connection traffic spec (fixed:... or\n");
+	printf("\t                         bursty:rps:...); a queue holds at most -q commands in flight\n");
+	printf("\t--traffic-rate <iops>    fixed: specs, commands per second per core\n");
+	printf("\t--workload-seed <n>      seed of the traffic (default: 1)\n");
+	printf("\t--traffic-backlog <n>    commands that may wait per queue (default: 1024)\n");
+	printf("\t--traffic-pool <n>       command buffers per core (default: 16384)\n");
 	printf("\t-N, --no-shst-notification no shutdown notification process for controllers, default: disabled\n");
 	printf("\t-Q, --continue-on-error <val> Do not stop on error. Log I/O errors every N times (default: 1)\n");
 	spdk_log_usage(stdout, "\t-T");
@@ -2839,6 +3365,16 @@ static const struct option g_perf_cmdline_opts[] = {
 	{"burst-pct",				required_argument,	NULL, PERF_BURST_PCT},
 #define PERF_BURST_INTERVAL	276
 	{"burst-interval",			required_argument,	NULL, PERF_BURST_INTERVAL},
+#define PERF_TRAFFIC		290
+	{"traffic",				required_argument,	NULL, PERF_TRAFFIC},
+#define PERF_TRAFFIC_RATE	291
+	{"traffic-rate",			required_argument,	NULL, PERF_TRAFFIC_RATE},
+#define PERF_WORKLOAD_SEED	292
+	{"workload-seed",			required_argument,	NULL, PERF_WORKLOAD_SEED},
+#define PERF_TRAFFIC_BACKLOG	293
+	{"traffic-backlog",			required_argument,	NULL, PERF_TRAFFIC_BACKLOG},
+#define PERF_TRAFFIC_POOL	294
+	{"traffic-pool",			required_argument,	NULL, PERF_TRAFFIC_POOL},
 	/* Should be the last element */
 	{0, 0, 0, 0}
 };
@@ -3082,6 +3618,48 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 			/* Converted to TSC ticks after g_tsc_rate is set in spdk_main() */
 			g_burst_interval_tsc = (uint64_t)val;
 			break;
+		case PERF_TRAFFIC: {
+			char err[512];
+			int bursty = 0;
+
+			if (perf_traffic_check(optarg, &bursty, err, sizeof(err)) != 0) {
+				fprintf(stderr, "--traffic: %s\n", err);
+				return 1;
+			}
+			g_traffic_spec = optarg;
+			g_traffic_bursty = bursty != 0;
+			break;
+		}
+		case PERF_TRAFFIC_RATE:
+			g_traffic_rate = strtoull(optarg, &endptr, 10);
+			if (*endptr != '\0') {
+				fprintf(stderr, "--traffic-rate must be an integer\n");
+				return 1;
+			}
+			break;
+		case PERF_WORKLOAD_SEED:
+			g_workload_seed = strtoull(optarg, &endptr, 10);
+			if (*endptr != '\0') {
+				fprintf(stderr, "--workload-seed must be an integer\n");
+				return 1;
+			}
+			break;
+		case PERF_TRAFFIC_BACKLOG:
+			val = spdk_strtol(optarg, 10);
+			if (val < 1) {
+				fprintf(stderr, "--traffic-backlog must be >= 1\n");
+				return 1;
+			}
+			g_traffic_backlog = (uint32_t)val;
+			break;
+		case PERF_TRAFFIC_POOL:
+			val = spdk_strtol(optarg, 10);
+			if (val < 1) {
+				fprintf(stderr, "--traffic-pool must be >= 1\n");
+				return 1;
+			}
+			g_traffic_pool = (uint32_t)val;
+			break;
 		case PERF_NO_SHST_NOTIFICATION:
 			g_no_shn_notification = true;
 			break;
@@ -3196,6 +3774,24 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 	if (!g_nr_io_queues_per_ns) {
 		usage(argv[0]);
 		return 1;
+	}
+
+	if (g_traffic_spec != NULL) {
+		if (g_burst_pct > 0 || g_total_iops > 0 || g_zcopy || g_number_ios) {
+			fprintf(stderr, "--traffic does not combine with --burst-pct, --total-iops, -Z "
+				"or -d/--number-ios\n");
+			return 1;
+		}
+		if (!g_traffic_bursty && g_traffic_rate == 0) {
+			fprintf(stderr, "--traffic %s needs --traffic-rate (commands/s per core)\n",
+				g_traffic_spec);
+			return 1;
+		}
+		if (g_traffic_bursty && g_traffic_rate != 0) {
+			fprintf(stderr, "--traffic %s carries its own load; drop --traffic-rate\n",
+				g_traffic_spec);
+			return 1;
+		}
 	}
 
 	if (!g_queue_depth) {
@@ -3724,6 +4320,11 @@ main(int argc, char **argv)
 		goto cleanup;
 	}
 
+	if (g_traffic_spec != NULL && traffic_setup() != 0) {
+		rc = -1;
+		goto cleanup;
+	}
+
 	rc = pthread_barrier_init(&g_worker_sync_barrier, NULL, g_num_workers);
 	if (rc != 0) {
 		fprintf(stderr, "Unable to initialize thread sync barrier\n");
@@ -3733,6 +4334,7 @@ main(int argc, char **argv)
 	printf("Initialization complete. Launching workers.\n");
 
 	/* Launch all of the secondary workers */
+	g_tsc_launch = spdk_get_ticks();
 	g_main_core = spdk_env_get_current_core();
 	main_worker = NULL;
 	TAILQ_FOREACH(worker, &g_workers, link) {
@@ -3752,6 +4354,9 @@ main(int argc, char **argv)
 	fprintf(stderr, "[exit] all worker threads done\n");
 
 	print_stats();
+	if (g_traffic_spec != NULL) {
+		traffic_print();
+	}
 
 	pthread_barrier_destroy(&g_worker_sync_barrier);
 
