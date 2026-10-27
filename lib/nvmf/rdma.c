@@ -6,6 +6,7 @@
 
 #include "spdk/stdinc.h"
 
+#include "spdk/barrier.h"
 #include "spdk/config.h"
 #include "spdk/thread.h"
 #include "spdk/likely.h"
@@ -556,6 +557,8 @@ struct spdk_nvmf_rdma_device {
 	/* XRC: domain, live XRC queues by TGT QPN, sessions. Guarded by xrc_lock,
 	 * which only the control path and shadow creation take. */
 	struct ibv_xrcd				*xrcd;
+	/* Pollers have XRC command SRQs: set by the device's first listener. */
+	bool					xrc_srqs;
 	pthread_mutex_t				xrc_lock;
 	RB_HEAD(xrc_tgt_tree, spdk_nvmf_rdma_xrc_qpair) xrc_tgts;
 	TAILQ_HEAD(, spdk_nvmf_rdma_xrc_session) xrc_sessions;
@@ -4722,6 +4725,104 @@ static int nvmf_rdma_trid_from_cm_id(struct rdma_cm_id *id,
 
 static bool nvmf_rdma_rescan_devices(struct spdk_nvmf_rdma_transport *rtransport);
 
+/*
+ * XRC command SRQ of one poller, with its receive buffers. Built in full
+ * before it is published: the poll group thread reads poller->xrc_srq on
+ * every poll.
+ */
+static int
+nvmf_rdma_poller_xrc_srq_create(struct spdk_nvmf_rdma_transport *rtransport,
+				struct spdk_nvmf_rdma_poller *poller)
+{
+	struct spdk_nvmf_rdma_device		*device = poller->device;
+	struct spdk_nvmf_rdma_resource_opts	opts = {};
+	struct ibv_srq_init_attr_ex		xattr = {};
+	struct spdk_rdma_provider_srq		*srq;
+	struct spdk_nvmf_rdma_resources		*resources;
+	uint32_t				srqn;
+
+	if (poller->max_xrc_srq_depth == 0 || poller->xrc_srq != NULL) {
+		return 0;
+	}
+	srq = calloc(1, sizeof(*srq));
+	if (srq == NULL) {
+		return -ENOMEM;
+	}
+	srq->stats = &poller->stat.qp_stats.recv;
+	srq->shared_stats = true;
+	xattr.comp_mask = IBV_SRQ_INIT_ATTR_TYPE | IBV_SRQ_INIT_ATTR_XRCD |
+			  IBV_SRQ_INIT_ATTR_CQ | IBV_SRQ_INIT_ATTR_PD;
+	xattr.srq_type = IBV_SRQT_XRC;
+	xattr.xrcd = device->xrcd;
+	xattr.cq = poller->cq->cq;
+	xattr.pd = device->pd;
+	xattr.attr.max_wr = poller->max_xrc_srq_depth;
+	xattr.attr.max_sge = spdk_min(device->attr.max_sge, NVMF_DEFAULT_RX_SGE);
+	srq->srq = ibv_create_srq_ex(device->context, &xattr);
+	if (srq->srq == NULL) {
+		SPDK_ERRLOG("XRC: ibv_create_srq_ex failed: %s\n", spdk_strerror(errno));
+		free(srq);
+		return -EIO;
+	}
+	if (ibv_get_srq_num(srq->srq, &srqn)) {
+		SPDK_ERRLOG("XRC: ibv_get_srq_num failed\n");
+		spdk_rdma_provider_srq_destroy(srq);
+		return -EIO;
+	}
+
+	opts.qp = srq;
+	opts.map = device->map;
+	opts.qpair = NULL;
+	opts.shared = true;
+	opts.max_queue_depth = poller->max_xrc_srq_depth;
+	opts.in_capsule_data_size = rtransport->transport.opts.in_capsule_data_size;
+	resources = nvmf_rdma_resources_create(&opts);
+	if (resources == NULL) {
+		SPDK_ERRLOG("XRC: unable to allocate resources for the command SRQ.\n");
+		spdk_rdma_provider_srq_destroy(srq);
+		return -ENOMEM;
+	}
+
+	poller->xrc_srqn = srqn;
+	poller->xrc_resources = resources;
+	spdk_wmb();
+	poller->xrc_srq = srq;
+	SPDK_NOTICELOG("XRC: poll group %u on %s: command SRQN 0x%x depth %u, CQ %d\n",
+		       poller->group->xrc_index, ibv_get_device_name(device->context->device),
+		       srqn, poller->max_xrc_srq_depth, poller->num_cqe);
+	return 0;
+}
+
+/*
+ * XRC command SRQs exist only on devices with a listener. The target opens
+ * every RDMA device of the host, and the receive buffers of an XRC SRQ per
+ * poll group cost ~90 MiB of hugepages per device (4 poll groups, depth 4096,
+ * 4032-byte in-capsule data), on top of the stock SRQs. Runs on the target
+ * thread at the device's first listen; poll groups exist by then, and a
+ * poller created later makes its own in nvmf_rdma_poller_create().
+ */
+static void
+nvmf_rdma_device_xrc_srqs_create(struct spdk_nvmf_rdma_transport *rtransport,
+				 struct spdk_nvmf_rdma_device *device)
+{
+	struct spdk_nvmf_rdma_poll_group	*rgroup;
+	struct spdk_nvmf_rdma_poller		*poller;
+
+	if (device->xrcd == NULL || device->xrc_srqs) {
+		return;
+	}
+	device->xrc_srqs = true;
+	TAILQ_FOREACH(rgroup, &rtransport->poll_groups, link) {
+		poller = nvmf_rdma_rgroup_poller(rgroup, device);
+		if (poller != NULL && nvmf_rdma_poller_xrc_srq_create(rtransport, poller) != 0) {
+			/* XRC queues on this device are refused at session setup;
+			 * RC queues are not affected. */
+			SPDK_ERRLOG("XRC: poll group %u has no command SRQ on %s\n", rgroup->xrc_index,
+				    ibv_get_device_name(device->context->device));
+		}
+	}
+}
+
 static int
 nvmf_rdma_listen(struct spdk_nvmf_transport *transport, const struct spdk_nvme_transport_id *trid,
 		 struct spdk_nvmf_listen_opts *listen_opts)
@@ -4845,6 +4946,7 @@ nvmf_rdma_listen(struct spdk_nvmf_transport *transport, const struct spdk_nvme_t
 		nvmf_rdma_rescan_devices(rtransport);
 		return -EINVAL;
 	}
+	nvmf_rdma_device_xrc_srqs_create(rtransport, port->device);
 
 	SPDK_NOTICELOG("*** NVMe/RDMA Target Listening on %s port %s ***\n",
 		       trid->traddr, trid->trsvcid);
@@ -5991,49 +6093,10 @@ nvmf_rdma_poller_create(struct spdk_nvmf_rdma_transport *rtransport,
 	}
 	poller->num_cqe = num_cqe;
 
-	if (poller->max_xrc_srq_depth != 0) {
-		struct ibv_srq_init_attr_ex xattr = {};
-
-		poller->xrc_srq = calloc(1, sizeof(*poller->xrc_srq));
-		if (poller->xrc_srq == NULL) {
-			return -1;
-		}
-		poller->xrc_srq->stats = &poller->stat.qp_stats.recv;
-		poller->xrc_srq->shared_stats = true;
-		xattr.comp_mask = IBV_SRQ_INIT_ATTR_TYPE | IBV_SRQ_INIT_ATTR_XRCD |
-				  IBV_SRQ_INIT_ATTR_CQ | IBV_SRQ_INIT_ATTR_PD;
-		xattr.srq_type = IBV_SRQT_XRC;
-		xattr.xrcd = device->xrcd;
-		xattr.cq = poller->cq->cq;
-		xattr.pd = device->pd;
-		xattr.attr.max_wr = poller->max_xrc_srq_depth;
-		xattr.attr.max_sge = spdk_min(device->attr.max_sge, NVMF_DEFAULT_RX_SGE);
-		poller->xrc_srq->srq = ibv_create_srq_ex(device->context, &xattr);
-		if (poller->xrc_srq->srq == NULL) {
-			SPDK_ERRLOG("XRC: ibv_create_srq_ex failed: %s\n", spdk_strerror(errno));
-			free(poller->xrc_srq);
-			poller->xrc_srq = NULL;
-			return -1;
-		}
-		if (ibv_get_srq_num(poller->xrc_srq->srq, &poller->xrc_srqn)) {
-			SPDK_ERRLOG("XRC: ibv_get_srq_num failed\n");
-			return -1;
-		}
-
-		opts.qp = poller->xrc_srq;
-		opts.map = device->map;
-		opts.qpair = NULL;
-		opts.shared = true;
-		opts.max_queue_depth = poller->max_xrc_srq_depth;
-		opts.in_capsule_data_size = rtransport->transport.opts.in_capsule_data_size;
-		poller->xrc_resources = nvmf_rdma_resources_create(&opts);
-		if (!poller->xrc_resources) {
-			SPDK_ERRLOG("XRC: unable to allocate resources for the command SRQ.\n");
-			return -1;
-		}
-		SPDK_NOTICELOG("XRC: poll group %u on %s: command SRQN 0x%x depth %u, CQ %d\n",
-			       rgroup->xrc_index, ibv_get_device_name(device->context->device),
-			       poller->xrc_srqn, poller->max_xrc_srq_depth, num_cqe);
+	/* The CQ above already counts the XRC SRQ; the SRQ itself comes with the
+	 * device's first listener (nvmf_rdma_device_xrc_srqs_create()). */
+	if (device->xrc_srqs) {
+		return nvmf_rdma_poller_xrc_srq_create(rtransport, poller);
 	}
 	return 0;
 }
