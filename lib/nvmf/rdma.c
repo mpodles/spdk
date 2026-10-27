@@ -19,6 +19,7 @@
 
 #include "spdk_internal/assert.h"
 #include "spdk/log.h"
+#include "spdk/rpc.h"
 #include "spdk_internal/rdma_provider.h"
 #include "spdk_internal/rdma_utils.h"
 #include "spdk_internal/nvmf_rdma_xrc.h"
@@ -7554,6 +7555,124 @@ const struct spdk_nvmf_transport_ops spdk_nvmf_transport_rdma = {
 
 	.poll_group_dump_stat = nvmf_rdma_poll_group_dump_stat,
 };
+
+/*
+ * RPC nvmf_xrc_get_topology: what a NIC pipeline in front of the target needs to
+ * steer XRC commands (docs/investigations/nvmeof_xrc_doca_p2c.md in the parent repo):
+ * per device with XRC command SRQs, the SRQN of each poll group; per host session,
+ * its state and the host's TGT QPNs (a response from worker w goes to host_tgt_qpns[w]);
+ * per host I/O queue, its TGT QPN, home poll group and whether it is enabled (Fabrics
+ * Connect done: only then may its commands go to another poll group). Read on the RPC
+ * thread under device->xrc_lock; the poll groups' SRQNs and pollers do not change
+ * after the device's first listener.
+ */
+static const char *
+nvmf_rdma_xrc_session_state_str(enum nvmf_rdma_xrc_session_state state)
+{
+	switch (state) {
+	case NVMF_RDMA_XRC_SESSION_CREATED:
+		return "created";
+	case NVMF_RDMA_XRC_SESSION_CONNECTED:
+		return "connected";
+	case NVMF_RDMA_XRC_SESSION_FAILED:
+		return "failed";
+	}
+	return "unknown";
+}
+
+static void
+rpc_nvmf_xrc_get_topology(struct spdk_jsonrpc_request *request, const struct spdk_json_val *params)
+{
+	struct spdk_nvmf_tgt *tgt = spdk_nvmf_get_tgt(NULL);
+	struct spdk_nvmf_transport *transport = tgt ? spdk_nvmf_tgt_get_transport(tgt, "RDMA") : NULL;
+	struct spdk_nvmf_rdma_transport *rtransport;
+	struct spdk_nvmf_rdma_device *device;
+	struct spdk_nvmf_rdma_poller *rpoller;
+	struct spdk_nvmf_rdma_xrc_session *session;
+	struct spdk_nvmf_rdma_xrc_qpair *xq;
+	struct spdk_json_write_ctx *w;
+	uint32_t i;
+
+	if (params != NULL) {
+		spdk_jsonrpc_send_error_response(request, SPDK_JSONRPC_ERROR_INVALID_PARAMS,
+						 "nvmf_xrc_get_topology takes no parameters");
+		return;
+	}
+	if (transport == NULL) {
+		spdk_jsonrpc_send_error_response(request, -ENODEV, "no RDMA transport");
+		return;
+	}
+	rtransport = SPDK_CONTAINEROF(transport, struct spdk_nvmf_rdma_transport, transport);
+
+	w = spdk_jsonrpc_begin_result(request);
+	spdk_json_write_object_begin(w);
+	spdk_json_write_named_bool(w, "xrc", rtransport->rdma_opts.xrc);
+	spdk_json_write_named_array_begin(w, "devices");
+	TAILQ_FOREACH(device, &rtransport->devices, link) {
+		if (!device->xrc_srqs) {
+			continue;
+		}
+		spdk_json_write_object_begin(w);
+		spdk_json_write_named_string(w, "name", device->context->device->name);
+
+		spdk_json_write_named_array_begin(w, "workers");
+		for (i = 0; i < rtransport->xrc_num_pgs; i++) {
+			TAILQ_FOREACH(rpoller, &rtransport->xrc_pgs[i]->pollers, link) {
+				if (rpoller->device == device) {
+					break;
+				}
+			}
+			spdk_json_write_object_begin(w);
+			spdk_json_write_named_uint32(w, "worker", i);
+			spdk_json_write_named_uint32(w, "srqn", rpoller ? rpoller->xrc_srqn : 0);
+			spdk_json_write_object_end(w);
+		}
+		spdk_json_write_array_end(w);
+
+		pthread_mutex_lock(&device->xrc_lock);
+		spdk_json_write_named_array_begin(w, "sessions");
+		TAILQ_FOREACH(session, &device->xrc_sessions, link) {
+			spdk_json_write_object_begin(w);
+			spdk_json_write_named_string_fmt(w, "id", "0x%" PRIx64, session->id);
+			spdk_json_write_named_string(w, "hostnqn", session->hostnqn);
+			spdk_json_write_named_string(w, "state", nvmf_rdma_xrc_session_state_str(session->state));
+			spdk_json_write_named_array_begin(w, "host_tgt_qpns");
+			for (i = 0; i < session->num_ini; i++) {
+				spdk_json_write_uint32(w, session->ini[i].host_tgt_qpn);
+			}
+			spdk_json_write_array_end(w);
+			spdk_json_write_named_array_begin(w, "ini_in_error");
+			for (i = 0; i < session->num_ini; i++) {
+				spdk_json_write_bool(w, session->ini[i].in_error);
+			}
+			spdk_json_write_array_end(w);
+			spdk_json_write_object_end(w);
+		}
+		spdk_json_write_array_end(w);
+
+		spdk_json_write_named_array_begin(w, "queues");
+		RB_FOREACH(xq, xrc_tgt_tree, &device->xrc_tgts) {
+			spdk_json_write_object_begin(w);
+			spdk_json_write_named_uint32(w, "tgt_qpn", xq->tgt_qpn);
+			spdk_json_write_named_string_fmt(w, "session", "0x%" PRIx64,
+							 xq->session ? xq->session->id : 0);
+			spdk_json_write_named_uint32(w, "qid", xq->rqpair->qpair.qid);
+			spdk_json_write_named_uint32(w, "home", xq->worker);
+			spdk_json_write_named_bool(w, "enabled",
+						   xq->rqpair->qpair.state == SPDK_NVMF_QPAIR_ENABLED &&
+						   !xq->closing && !xq->doomed);
+			spdk_json_write_object_end(w);
+		}
+		spdk_json_write_array_end(w);
+		pthread_mutex_unlock(&device->xrc_lock);
+
+		spdk_json_write_object_end(w);
+	}
+	spdk_json_write_array_end(w);
+	spdk_json_write_object_end(w);
+	spdk_jsonrpc_end_result(request, w);
+}
+SPDK_RPC_REGISTER("nvmf_xrc_get_topology", rpc_nvmf_xrc_get_topology, SPDK_RPC_RUNTIME)
 
 SPDK_NVMF_TRANSPORT_REGISTER(rdma, &spdk_nvmf_transport_rdma);
 SPDK_LOG_REGISTER_COMPONENT(rdma)
