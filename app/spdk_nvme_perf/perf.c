@@ -261,6 +261,7 @@ struct traffic_core {
 	uint64_t		waited;
 	uint64_t		dropped;
 	uint64_t		errors;
+	uint64_t		pool_waits;	/* commands that found no free task of their size */
 	uint32_t		backlog_max;
 };
 
@@ -323,9 +324,6 @@ static bool g_monitor_perf_cores = false;
 static uint32_t g_io_align = 0x200;
 static bool g_io_align_specified;
 static uint32_t g_io_size_bytes;
-/* Bytes for the next allocate_task() buffers; 0: g_io_size_bytes. Set only by
- * traffic_setup (main thread, before the workers start). */
-static uint32_t g_alloc_io_bytes;
 static uint32_t g_max_io_md_size;
 static uint32_t g_max_io_size_blocks;
 static uint32_t g_metacfg_pract_flag;
@@ -520,8 +518,7 @@ nvme_perf_allocate_iovs(struct perf_task *task, uint8_t pattern)
 	/* maximum extended lba format size from all active namespace,
 	 * it's same with g_io_size_bytes for namespace without metadata.
 	 */
-	max_io_size_bytes = (g_alloc_io_bytes ? g_alloc_io_bytes : g_io_size_bytes) +
-			    g_max_io_md_size * g_max_io_size_blocks;
+	max_io_size_bytes = g_io_size_bytes + g_max_io_md_size * g_max_io_size_blocks;
 
 	/* Allow the user to configure the gap between iovs. If g_io_align is not set then use gap size aligned on the
 	 * min page size reported by controller to be compliant with NVME PRP disks */
@@ -959,8 +956,7 @@ nvme_setup_payload(struct perf_task *task, uint8_t pattern)
 	/* maximum extended lba format size from all active namespace,
 	 * it's same with g_io_size_bytes for namespace without metadata.
 	 */
-	max_io_size_bytes = (g_alloc_io_bytes ? g_alloc_io_bytes : g_io_size_bytes) +
-			    g_max_io_md_size * g_max_io_size_blocks;
+	max_io_size_bytes = g_io_size_bytes + g_max_io_md_size * g_max_io_size_blocks;
 	buf = spdk_dma_zmalloc_socket(max_io_size_bytes, g_io_align, NULL, numa_id);
 	if (buf == NULL) {
 		fprintf(stderr, "task->buf spdk_dma_zmalloc failed\n");
@@ -1811,6 +1807,11 @@ task_complete(struct perf_task *task)
 	 * replace the one just completed.
 	 */
 	if (spdk_unlikely(ns_ctx->is_draining)) {
+		if (ns_ctx->tc != NULL) {
+			/* --traffic: buffers are slices of one region per core; keep them. */
+			ns_ctx->tc->inflight--;
+			return;
+		}
 		if (!g_zcopy) {
 			spdk_dma_free(task->iovs[0].iov_base);
 			free(task->iovs);
@@ -2083,6 +2084,7 @@ traffic_arrival(struct traffic_core *tc, uint32_t qi, uint64_t sched)
 			return;
 		}
 		/* The queue has room but the core has no free task of this size. */
+		tc->pool_waits++;
 		traffic_backlog_push(tc, qi, sched, cls);
 		traffic_ready_push(tc, qi);
 		return;
@@ -2140,6 +2142,7 @@ traffic_reset_stats(struct traffic_core *tc)
 	tc->waited = 0;
 	tc->dropped = 0;
 	tc->errors = 0;
+	tc->pool_waits = 0;
 	tc->backlog_max = 0;
 	tc->inflight_max = tc->inflight;
 	spdk_histogram_data_reset(tc->hist_sched);
@@ -2197,6 +2200,10 @@ traffic_setup(void)
 	TAILQ_FOREACH(entry, &g_namespaces, link) {
 		if (entry->type != ENTRY_TYPE_NVME_NS) {
 			fprintf(stderr, "--traffic needs NVMe namespaces (not AIO/uring files)\n");
+			return -1;
+		}
+		if (entry->md_size != 0) {
+			fprintf(stderr, "--traffic needs namespaces without metadata\n");
 			return -1;
 		}
 		if (entry->io_size_blocks != first->io_size_blocks || entry->md_size != first->md_size ||
@@ -2273,20 +2280,40 @@ traffic_setup(void)
 		if (nq == 0) {
 			continue;
 		}
-		/* Buffers per size class: the class's share of the pool, at least 64. */
+		/* Buffers per size class: the class's share of the pool, at least 64,
+		 * cut from one DMA region per class (one allocation per class and core:
+		 * thousands of separate ones took long enough for the target to drop
+		 * the controllers for missed keep-alives). */
 		for (i = 0; i < (g_mix_n ? g_mix_n : 1); i++) {
 			uint32_t share = g_mix_n ? g_mix_cum[i] - (i ? g_mix_cum[i - 1] : 0) : 100000;
 			uint32_t want = spdk_max(64u, (uint32_t)((uint64_t)g_traffic_pool * share / 100000));
+			uint64_t bytes = g_mix_n ? g_mix_bytes[i] : g_io_size_bytes;
+			uint64_t stride = SPDK_ALIGN_CEIL(bytes, 4096);
 			struct ns_worker_ctx *first_ctx = TAILQ_FIRST(&worker->ns_ctx);
+			uint8_t *region = spdk_dma_zmalloc_socket(stride * want, 4096, NULL,
+					  spdk_nvme_ctrlr_get_numa_id(first_ctx->entry->u.nvme.ctrlr));
 
-			g_alloc_io_bytes = g_mix_n ? g_mix_bytes[i] : 0;
+			if (region == NULL) {
+				fprintf(stderr, "--traffic-pool: no DMA memory for %u x %" PRIu64 " B on core %u\n",
+					want, bytes, worker->lcore);
+				rc = -ENOMEM;
+				goto out;
+			}
 			for (k = 0; k < want; k++) {
-				struct perf_task *task = allocate_task(first_ctx, (int)k);
+				struct perf_task *task = calloc(1, sizeof(*task));
 
+				if (task == NULL || (task->iovs = calloc(1, sizeof(struct iovec))) == NULL) {
+					rc = -ENOMEM;
+					goto out;
+				}
+				task->ns_ctx = first_ctx;
+				task->iovcnt = 1;
+				task->iovs[0].iov_base = region + (uint64_t)k * stride;
+				task->iovs[0].iov_len = bytes;
+				memset(task->iovs[0].iov_base, (int)(k % 8 + 1), bytes);
 				TAILQ_INSERT_TAIL(&tc->free_cls[i], task, link);
 				tc->tasks++;
 			}
-			g_alloc_io_bytes = 0;
 		}
 		tc->engine = perf_traffic_create(g_traffic_spec, tc->global_ids, nq, total, g_traffic_rate,
 						 g_tsc_rate, 0, traffic_core_seed(worker), err, sizeof(err));
@@ -2345,6 +2372,7 @@ traffic_print(void)
 	struct spdk_histogram_data *hv = spdk_histogram_data_alloc();
 	struct worker_thread *worker;
 	uint64_t arrivals = 0, posted = 0, completed = 0, waited = 0, dropped = 0, errors = 0;
+	uint64_t pool_waits = 0;
 	uint32_t backlog_max = 0, tasks_max = 0;
 	double secs = (double)g_elapsed_time_in_usec / 1e6, offered = 0;
 	double ps[5] = {0}, pv[5] = {0};
@@ -2366,6 +2394,7 @@ traffic_print(void)
 		waited += tc->waited;
 		dropped += tc->dropped;
 		errors += tc->errors;
+		pool_waits += tc->pool_waits;
 		backlog_max = spdk_max(backlog_max, tc->backlog_max);
 		tasks_max = spdk_max(tasks_max, tc->inflight_max);
 		if (tc->engine != NULL) {
@@ -2388,6 +2417,9 @@ traffic_print(void)
 	printf("TRAFFIC_RESULT DROPPED_PCT %.4f\n", arrivals ? 100.0 * dropped / arrivals : 0.0);
 	printf("TRAFFIC_RESULT BACKLOG_MAX %u\n", backlog_max);
 	printf("TRAFFIC_RESULT TASKS_MAX %u\n", tasks_max);
+	/* Commands that waited because the core had no free buffer: the instrument's
+	 * limit (--traffic-pool), not the target's. */
+	printf("TRAFFIC_RESULT POOL_WAIT_PCT %.4f\n", arrivals ? 100.0 * pool_waits / arrivals : 0.0);
 	printf("TRAFFIC_RESULT SUBMIT_ERRORS %" PRIu64 "\n", errors);
 	printf("TRAFFIC_RESULT QUEUES %u\n", g_traffic_total_queues);
 	printf("TRAFFIC_RESULT CLIENTS %d\n", g_num_namespaces);
