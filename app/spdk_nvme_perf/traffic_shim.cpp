@@ -5,6 +5,7 @@
 
 #include "traffic_engine.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <new>
@@ -111,6 +112,36 @@ extern "C" double
 perf_traffic_offered(const struct perf_traffic *t)
 {
 	return t->offered;
+}
+
+extern "C" uint32_t
+perf_traffic_classes(const struct perf_traffic *t)
+{
+	return t->spec.mode == TrafficMode::BURSTY ? t->spec.nb_classes : 1;
+}
+
+extern "C" uint32_t
+perf_traffic_queue_class(const struct perf_traffic *t, uint32_t i)
+{
+	return t->spec.mode == TrafficMode::BURSTY ? t->engine.source_class(i) : 0;
+}
+
+extern "C" double
+perf_traffic_queue_rate(const struct perf_traffic *t, uint32_t i, uint32_t b)
+{
+	if (t->spec.mode != TrafficMode::BURSTY) {
+		return 0;
+	}
+	if (b < 2) {
+		return t->engine.source_rate(i, b);
+	}
+	/* Mean: weighted by the share of time bursting, from the mean burst length
+	 * (a lognormal's median x exp(sigma^2 / 2)) and the mean quiet length. */
+	const TrafficClass &k = t->spec.classes[t->engine.source_class(i)];
+	const double sig = (double)k.burst_sigma_milli / 1000.0;
+	const double B = (double)k.burst_ns * std::exp(sig * sig / 2);
+	const double s = B / (B + (double)k.quiet_ns);
+	return t->engine.source_rate(i, 0) * (1 - s) + t->engine.source_rate(i, 1) * s;
 }
 
 extern "C" void

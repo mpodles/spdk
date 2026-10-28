@@ -38,6 +38,16 @@ uint32_t perf_traffic_poll(struct perf_traffic *t, uint64_t now, uint64_t *sched
  * (fixed:). */
 double perf_traffic_offered(const struct perf_traffic *t);
 
+/* bursty: the spec's Burst classes (1 for fixed:). */
+uint32_t perf_traffic_classes(const struct perf_traffic *t);
+
+/* bursty: the Burst class of queue i (0 for fixed:). */
+uint32_t perf_traffic_queue_class(const struct perf_traffic *t, uint32_t i);
+
+/* bursty: queue i's request rate per second while bursting (b = 1), while
+ * quiet (b = 0), or on average over both states (b = 2). 0 for fixed:. */
+double perf_traffic_queue_rate(const struct perf_traffic *t, uint32_t i, uint32_t b);
+
 /* The spec in korba's canonical spelling. */
 void perf_traffic_format(const struct perf_traffic *t, char *out, size_t len);
 

@@ -219,6 +219,7 @@ struct worker_thread {
  * is full. Latency is measured from the scheduled time, so waiting counts.
  */
 #define PERF_MAX_SIZE_MIX 8
+#define PERF_MAX_BURST_CLASSES 8
 
 /* A command waiting in its queue's backlog: when it was due and its size. */
 struct traffic_wait {
@@ -234,6 +235,8 @@ struct traffic_queue {
 	uint32_t		count;
 	struct traffic_wait	*ring;	/* g_traffic_backlog entries, allocated on first use */
 	bool			in_ready;
+	uint32_t		bcls;		/* bursty: its Burst class */
+	uint64_t		arrivals;	/* measured window */
 };
 
 struct traffic_core {
@@ -254,6 +257,9 @@ struct traffic_core {
 	struct spdk_histogram_data *hist_sched;	/* completion - scheduled time */
 	struct spdk_histogram_data *hist_svc;	/* completion - submit */
 	struct spdk_histogram_data *hist_cls[PERF_MAX_SIZE_MIX]; /* scheduled time, per size */
+	/* bursty with more than one Burst class: scheduled time per class */
+	uint32_t		nbcls;
+	struct spdk_histogram_data *hist_bcls[PERF_MAX_BURST_CLASSES];
 	uint64_t		bytes;
 	uint64_t		arrivals;
 	uint64_t		posted;
@@ -2073,6 +2079,7 @@ traffic_arrival(struct traffic_core *tc, uint32_t qi, uint64_t sched)
 	uint32_t		cls;
 
 	tc->arrivals++;
+	q->arrivals++;
 	if (q->ns_ctx->is_draining) {
 		return;
 	}
@@ -2101,6 +2108,9 @@ traffic_complete(struct perf_task *task)
 
 	spdk_histogram_data_tally(tc->hist_sched, now - task->sched_tsc);
 	spdk_histogram_data_tally(tc->hist_svc, now - task->submit_tsc);
+	if (tc->nbcls > 1) {
+		spdk_histogram_data_tally(tc->hist_bcls[q->bcls], now - task->sched_tsc);
+	}
 	if (g_mix_n > 0) {
 		spdk_histogram_data_tally(tc->hist_cls[task->size_cls], now - task->sched_tsc);
 		tc->bytes += g_mix_bytes[task->size_cls];
@@ -2149,6 +2159,12 @@ traffic_reset_stats(struct traffic_core *tc)
 	spdk_histogram_data_reset(tc->hist_svc);
 	for (uint32_t i = 0; i < g_mix_n; i++) {
 		spdk_histogram_data_reset(tc->hist_cls[i]);
+	}
+	for (uint32_t i = 0; i < tc->nbcls && tc->nbcls > 1; i++) {
+		spdk_histogram_data_reset(tc->hist_bcls[i]);
+	}
+	for (uint32_t i = 0; i < tc->nq; i++) {
+		tc->q[i].arrivals = 0;
 	}
 	tc->bytes = 0;
 }
@@ -2322,6 +2338,18 @@ traffic_setup(void)
 			rc = -EINVAL;
 			goto out;
 		}
+		/* A queue's Burst class depends only on the seed and its global index. */
+		tc->nbcls = perf_traffic_classes(tc->engine);
+		for (k = 0; k < nq; k++) {
+			tc->q[k].bcls = perf_traffic_queue_class(tc->engine, k);
+		}
+		for (i = 0; i < tc->nbcls && tc->nbcls > 1; i++) {
+			tc->hist_bcls[i] = spdk_histogram_data_alloc();
+			if (tc->hist_bcls[i] == NULL) {
+				rc = -ENOMEM;
+				goto out;
+			}
+		}
 		if (worker->index == 0) {
 			char canon[512];
 
@@ -2360,6 +2388,83 @@ traffic_pct_cb(void *ctx, uint64_t start, uint64_t end, uint64_t count, uint64_t
 	}
 	while (p->i < p->n && (double)so_far / total >= p->cut[p->i]) {
 		p->out[p->i++] = (double)end * 1000 * 1000 / g_tsc_rate;
+	}
+}
+
+/* bursty: the fastest queues by the engine's rates, latency per Burst class,
+ * and the ten queues that sent the most in the measured window. */
+static void
+traffic_print_queues(const double *cut, const char **name, double secs)
+{
+	struct worker_thread *worker;
+	struct traffic_pct_ctx ctx;
+	double mean_max = 0, burst_max = 0;
+	uint64_t cls_arr[PERF_MAX_BURST_CLASSES] = {0}, all = 0;
+	uint32_t ncls = 0, c, i;
+	struct {
+		uint64_t arrivals;
+		uint32_t gid, cls;
+		double mean, burst;
+	} top[10] = {{0}};
+
+	if (!g_traffic_bursty) {
+		return;
+	}
+	TAILQ_FOREACH(worker, &g_workers, link) {
+		struct traffic_core *tc = worker->tc;
+
+		if (tc == NULL || tc->engine == NULL) {
+			continue;
+		}
+		ncls = spdk_max(ncls, tc->nbcls);
+		for (i = 0; i < tc->nq; i++) {
+			struct traffic_queue *q = &tc->q[i];
+			double m = perf_traffic_queue_rate(tc->engine, i, 2);
+			double b = perf_traffic_queue_rate(tc->engine, i, 1);
+			int j;
+
+			mean_max = spdk_max(mean_max, m);
+			burst_max = spdk_max(burst_max, b);
+			cls_arr[q->bcls] += q->arrivals;
+			all += q->arrivals;
+			if (q->arrivals <= top[9].arrivals) {
+				continue;
+			}
+			for (j = 9; j > 0 && top[j - 1].arrivals < q->arrivals; j--) {
+				top[j] = top[j - 1];
+			}
+			top[j].arrivals = q->arrivals;
+			top[j].gid = tc->global_ids[i];
+			top[j].cls = q->bcls;
+			top[j].mean = m;
+			top[j].burst = b;
+		}
+	}
+	printf("TRAFFIC_RESULT QUEUE_MEAN_MAX %.0f\n", mean_max);
+	printf("TRAFFIC_RESULT QUEUE_BURST_MAX %.0f\n", burst_max);
+	for (i = 0; i < 10 && top[i].arrivals > 0; i++) {
+		printf("TRAFFIC_TOPQ queue=%u class=%u mean=%.0f burst=%.0f measured=%.0f\n", top[i].gid,
+		       top[i].cls, top[i].mean, top[i].burst, top[i].arrivals / secs);
+	}
+	for (c = 0; c < ncls && ncls > 1; c++) {
+		struct spdk_histogram_data *h = spdk_histogram_data_alloc();
+		double pc[5] = {0};
+
+		if (h == NULL) {
+			break;
+		}
+		TAILQ_FOREACH(worker, &g_workers, link) {
+			if (worker->tc != NULL && worker->tc->nbcls > 1) {
+				spdk_histogram_data_merge(h, worker->tc->hist_bcls[c]);
+			}
+		}
+		ctx = (struct traffic_pct_ctx) { cut, pc, 5, 0 };
+		spdk_histogram_data_iterate(h, traffic_pct_cb, &ctx);
+		printf("TRAFFIC_RESULT ARRIVAL_PCT_C%u %.3f\n", c, all ? 100.0 * cls_arr[c] / all : 0.0);
+		for (i = 0; i < 5; i++) {
+			printf("TRAFFIC_RESULT %s_SCHED_US_C%u %.3f\n", name[i], c, pc[i]);
+		}
+		spdk_histogram_data_free(h);
 	}
 }
 
@@ -2452,6 +2557,7 @@ traffic_print(void)
 		}
 		spdk_histogram_data_free(hc);
 	}
+	traffic_print_queues(cut, name, secs);
 	for (i = 0; i < 5; i++) {
 		printf("TRAFFIC_RESULT %s_SCHED_US %.3f\n", name[i], ps[i]);
 	}
