@@ -191,6 +191,8 @@ struct perf_task {
 	int			qp_idx;   /* QP index used for this task; set by submit_single_io */
 	uint64_t		sched_tsc; /* --traffic: when the command was due */
 	uint32_t		tq;        /* --traffic: queue index within its core */
+	uint32_t		io_blocks; /* --io-size-mix: this command's size in blocks (0: -o) */
+	uint32_t		size_cls;  /* --io-size-mix: index of its size */
 	struct spdk_dif_ctx	dif_ctx;
 #if HAVE_LIBAIO
 	struct iocb		iocb;
@@ -216,13 +218,21 @@ struct worker_thread {
  * waits in that queue's backlog, oldest first, and is dropped when the backlog
  * is full. Latency is measured from the scheduled time, so waiting counts.
  */
+#define PERF_MAX_SIZE_MIX 8
+
+/* A command waiting in its queue's backlog: when it was due and its size. */
+struct traffic_wait {
+	uint64_t	sched;
+	uint32_t	cls;
+};
+
 struct traffic_queue {
 	struct ns_worker_ctx	*ns_ctx;
 	int			qp_idx;
 	uint32_t		inflight;
 	uint32_t		head;	/* backlog ring: the oldest at head */
 	uint32_t		count;
-	uint64_t		*ring;	/* g_traffic_backlog scheduled times, allocated on first use */
+	struct traffic_wait	*ring;	/* g_traffic_backlog entries, allocated on first use */
 	bool			in_ready;
 };
 
@@ -231,13 +241,20 @@ struct traffic_core {
 	uint32_t		nq;
 	struct traffic_queue	*q;
 	uint32_t		*global_ids;
-	TAILQ_HEAD(, perf_task)	free_tasks;
-	uint32_t		tasks;		/* allocated so far, at most g_traffic_pool */
+	/* Free tasks per size class (one class without --io-size-mix), all
+	 * allocated before the run: allocating DMA buffers while sending stalls
+	 * every core on DPDK's heap lock. */
+	TAILQ_HEAD(, perf_task)	free_cls[PERF_MAX_SIZE_MIX];
+	uint32_t		tasks;		/* allocated */
+	uint32_t		inflight;
+	uint32_t		inflight_max;
 	uint32_t		*ready;		/* ring of queues that wait only for a free task */
 	uint32_t		ready_head;
 	uint32_t		ready_count;
 	struct spdk_histogram_data *hist_sched;	/* completion - scheduled time */
 	struct spdk_histogram_data *hist_svc;	/* completion - submit */
+	struct spdk_histogram_data *hist_cls[PERF_MAX_SIZE_MIX]; /* scheduled time, per size */
+	uint64_t		bytes;
 	uint64_t		arrivals;
 	uint64_t		posted;
 	uint64_t		completed;
@@ -252,9 +269,15 @@ static bool g_traffic_bursty = false;
 static uint64_t g_traffic_rate = 0;		/* per core, fixed: specs */
 static uint64_t g_workload_seed = 1;
 static uint32_t g_traffic_backlog = 1024;	/* per queue */
-static uint32_t g_traffic_pool = 16384;		/* tasks per core */
+static uint32_t g_traffic_pool = 2048;		/* tasks per core */
 static uint32_t g_traffic_total_queues = 0;
-static uint64_t g_tsc_launch = 0;		/* workers launched; for QUEUES_CONNECTED_S */
+static uint64_t g_tsc_launch = 0;
+static uint32_t g_rdma_cm_timeout_ms = 0;	/* 0: the transport default (1000) */
+/* --io-size-mix <bytes>:<percent>,...: each command draws its size; buffers
+ * are allocated for the largest (g_io_size_bytes). */
+static uint32_t g_mix_n = 0;
+static uint32_t g_mix_bytes[PERF_MAX_SIZE_MIX];
+static uint32_t g_mix_cum[PERF_MAX_SIZE_MIX];	/* cumulative, in 1/100000 */		/* workers launched; for QUEUES_CONNECTED_S */
 
 struct ns_fn_table {
 	void	(*setup_payload)(struct perf_task *task, uint8_t pattern);
@@ -300,6 +323,9 @@ static bool g_monitor_perf_cores = false;
 static uint32_t g_io_align = 0x200;
 static bool g_io_align_specified;
 static uint32_t g_io_size_bytes;
+/* Bytes for the next allocate_task() buffers; 0: g_io_size_bytes. Set only by
+ * traffic_setup (main thread, before the workers start). */
+static uint32_t g_alloc_io_bytes;
 static uint32_t g_max_io_md_size;
 static uint32_t g_max_io_size_blocks;
 static uint32_t g_metacfg_pract_flag;
@@ -494,7 +520,8 @@ nvme_perf_allocate_iovs(struct perf_task *task, uint8_t pattern)
 	/* maximum extended lba format size from all active namespace,
 	 * it's same with g_io_size_bytes for namespace without metadata.
 	 */
-	max_io_size_bytes = g_io_size_bytes + g_max_io_md_size * g_max_io_size_blocks;
+	max_io_size_bytes = (g_alloc_io_bytes ? g_alloc_io_bytes : g_io_size_bytes) +
+			    g_max_io_md_size * g_max_io_size_blocks;
 
 	/* Allow the user to configure the gap between iovs. If g_io_align is not set then use gap size aligned on the
 	 * min page size reported by controller to be compliant with NVME PRP disks */
@@ -932,7 +959,8 @@ nvme_setup_payload(struct perf_task *task, uint8_t pattern)
 	/* maximum extended lba format size from all active namespace,
 	 * it's same with g_io_size_bytes for namespace without metadata.
 	 */
-	max_io_size_bytes = g_io_size_bytes + g_max_io_md_size * g_max_io_size_blocks;
+	max_io_size_bytes = (g_alloc_io_bytes ? g_alloc_io_bytes : g_io_size_bytes) +
+			    g_max_io_md_size * g_max_io_size_blocks;
 	buf = spdk_dma_zmalloc_socket(max_io_size_bytes, g_io_align, NULL, numa_id);
 	if (buf == NULL) {
 		fprintf(stderr, "task->buf spdk_dma_zmalloc failed\n");
@@ -1019,6 +1047,7 @@ nvme_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
 	       struct ns_entry *entry, uint64_t offset_in_ios)
 {
 	uint64_t lba;
+	uint32_t nblocks;
 	int rc;
 	int qp_num;
 	struct spdk_dif_ctx_init_ext_opts dif_opts;
@@ -1030,6 +1059,7 @@ nvme_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
 	}  mode = DIF_MODE_NONE;
 
 	lba = offset_in_ios * entry->io_size_blocks;
+	nblocks = task->io_blocks ? task->io_blocks : entry->io_size_blocks;
 
 	if (entry->md_size != 0 && !(entry->io_flags & SPDK_NVME_IO_FLAGS_PRACT)) {
 		if (entry->md_interleave) {
@@ -1056,7 +1086,7 @@ nvme_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
 		rc = spdk_dif_ctx_init(&task->dif_ctx, entry->block_size, entry->md_size,
 				       entry->md_interleave, entry->pi_loc,
 				       (enum spdk_dif_type)entry->pi_type, entry->io_flags,
-				       lba, 0xFFFF, (uint16_t)entry->io_size_blocks, 0, 0, &dif_opts);
+				       lba, 0xFFFF, (uint16_t)nblocks, 0, 0, &dif_opts);
 		if (rc != 0) {
 			fprintf(stderr, "Initialization of DIF context failed\n");
 			exit(1);
@@ -1066,7 +1096,7 @@ nvme_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
 	if (task->is_read) {
 		if (g_zcopy) {
 			return spdk_nvme_ns_cmd_zcopy_start(entry->u.nvme.ns, ns_ctx->u.nvme.qpair[qp_num],
-							    lba, entry->io_size_blocks,
+							    lba, nblocks,
 							    nvme_read_zcopy_start_done,
 							    task, entry->io_flags, true,
 							    task->dif_ctx.apptag_mask, task->dif_ctx.app_tag);
@@ -1075,12 +1105,12 @@ nvme_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
 			return spdk_nvme_ns_cmd_read_with_md(entry->u.nvme.ns, ns_ctx->u.nvme.qpair[qp_num],
 							     task->iovs[0].iov_base, task->md_iov.iov_base,
 							     lba,
-							     entry->io_size_blocks, io_complete,
+							     nblocks, io_complete,
 							     task, entry->io_flags,
 							     task->dif_ctx.apptag_mask, task->dif_ctx.app_tag);
 		} else {
 			return spdk_nvme_ns_cmd_readv_with_md(entry->u.nvme.ns, ns_ctx->u.nvme.qpair[qp_num],
-							      lba, entry->io_size_blocks,
+							      lba, nblocks,
 							      io_complete, task, entry->io_flags,
 							      nvme_perf_reset_sgl, nvme_perf_next_sge,
 							      task->md_iov.iov_base,
@@ -1089,14 +1119,14 @@ nvme_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
 	} else {
 		switch (mode) {
 		case DIF_MODE_DIF:
-			rc = spdk_dif_generate(task->iovs, task->iovcnt, entry->io_size_blocks, &task->dif_ctx);
+			rc = spdk_dif_generate(task->iovs, task->iovcnt, nblocks, &task->dif_ctx);
 			if (rc != 0) {
 				fprintf(stderr, "Generation of DIF failed\n");
 				return rc;
 			}
 			break;
 		case DIF_MODE_DIX:
-			rc = spdk_dix_generate(task->iovs, task->iovcnt, &task->md_iov, entry->io_size_blocks,
+			rc = spdk_dix_generate(task->iovs, task->iovcnt, &task->md_iov, nblocks,
 					       &task->dif_ctx);
 			if (rc != 0) {
 				fprintf(stderr, "Generation of DIX failed\n");
@@ -1111,12 +1141,12 @@ nvme_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
 			return spdk_nvme_ns_cmd_write_with_md(entry->u.nvme.ns, ns_ctx->u.nvme.qpair[qp_num],
 							      task->iovs[0].iov_base, task->md_iov.iov_base,
 							      lba,
-							      entry->io_size_blocks, io_complete,
+							      nblocks, io_complete,
 							      task, entry->io_flags,
 							      task->dif_ctx.apptag_mask, task->dif_ctx.app_tag);
 		} else {
 			return spdk_nvme_ns_cmd_writev_with_md(entry->u.nvme.ns, ns_ctx->u.nvme.qpair[qp_num],
-							       lba, entry->io_size_blocks,
+							       lba, nblocks,
 							       io_complete, task, entry->io_flags,
 							       nvme_perf_reset_sgl, nvme_perf_next_sge,
 							       task->md_iov.iov_base,
@@ -1247,7 +1277,7 @@ nvme_init_ns_worker_ctx(struct ns_worker_ctx *ns_ctx)
 	 * I/O we aren't still waiting for some qpairs to connect. Limit the poll to
 	 * 10 seconds though.
 	 */
-	poll_timeout_tsc = spdk_get_ticks() + 10 * spdk_get_ticks_hz();
+	poll_timeout_tsc = spdk_get_ticks() + (10 + 2 * g_rdma_cm_timeout_ms / 1000) * spdk_get_ticks_hz();
 	rc = -EAGAIN;
 	while (spdk_get_ticks() < poll_timeout_tsc && rc == -EAGAIN) {
 		spdk_nvme_poll_group_process_completions(group, 0, perf_disconnect_cb);
@@ -1621,6 +1651,24 @@ register_ctrlr(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_trid_entry *trid_
 }
 
 static inline void
+pick_io_size(struct perf_task *task, struct ns_entry *entry)
+{
+	uint64_t r;
+	uint32_t i;
+
+	if (g_mix_n == 0) {
+		task->io_blocks = 0;
+		task->size_cls = 0;
+		return;
+	}
+	r = spdk_rand_xorshift64(&entry->seed) % 100000;
+	for (i = 0; i + 1 < g_mix_n && r >= g_mix_cum[i]; i++) {
+	}
+	task->size_cls = i;
+	task->io_blocks = (uint32_t)((uint64_t)g_mix_bytes[i] * entry->io_size_blocks / g_io_size_bytes);
+}
+
+static inline void
 submit_single_io(struct perf_task *task)
 {
 	uint64_t		rand_value, offset_in_ios;
@@ -1669,6 +1717,7 @@ submit_single_io(struct perf_task *task)
 	}
 
 	task->submit_tsc = spdk_get_ticks();
+	pick_io_size(task, entry);
 
 	if ((g_rw_percentage == 100) ||
 	    (g_rw_percentage != 0 &&
@@ -1859,25 +1908,34 @@ submit_io(struct ns_worker_ctx *ns_ctx, int queue_depth)
 /* ---- --traffic: open-loop sending (struct traffic_core) ---- */
 
 static struct perf_task *
-traffic_get_task(struct traffic_core *tc, struct ns_worker_ctx *ns_ctx)
+traffic_get_task(struct traffic_core *tc, uint32_t cls)
 {
-	struct perf_task *task = TAILQ_FIRST(&tc->free_tasks);
+	struct perf_task *task = TAILQ_FIRST(&tc->free_cls[cls]);
 
 	if (task != NULL) {
-		TAILQ_REMOVE(&tc->free_tasks, task, link);
-		return task;
+		TAILQ_REMOVE(&tc->free_cls[cls], task, link);
 	}
-	if (tc->tasks >= g_traffic_pool) {
-		return NULL;
+	return task;
+}
+
+static uint32_t
+traffic_draw_cls(struct ns_entry *entry)
+{
+	uint64_t r;
+	uint32_t i;
+
+	if (g_mix_n == 0) {
+		return 0;
 	}
-	tc->tasks++;
-	/* Every namespace has the same block and metadata size (checked in
-	 * traffic_setup), so a task's buffers fit any of the core's queues. */
-	return allocate_task(ns_ctx, (int)tc->tasks);
+	r = spdk_rand_xorshift64(&entry->seed) % 100000;
+	for (i = 0; i + 1 < g_mix_n && r >= g_mix_cum[i]; i++) {
+	}
+	return i;
 }
 
 static void
-traffic_send(struct traffic_core *tc, uint32_t qi, uint64_t sched, struct perf_task *task)
+traffic_send(struct traffic_core *tc, uint32_t qi, uint64_t sched, uint32_t cls,
+	     struct perf_task *task)
 {
 	struct traffic_queue	*q = &tc->q[qi];
 	struct ns_worker_ctx	*ns_ctx = q->ns_ctx;
@@ -1889,6 +1947,9 @@ traffic_send(struct traffic_core *tc, uint32_t qi, uint64_t sched, struct perf_t
 	task->qp_idx = q->qp_idx;
 	task->tq = qi;
 	task->sched_tsc = sched;
+	task->size_cls = cls;
+	task->io_blocks = g_mix_n == 0 ? 0 :
+			  (uint32_t)((uint64_t)g_mix_bytes[cls] * entry->io_size_blocks / g_io_size_bytes);
 
 	if (entry->zipf) {
 		offset_in_ios = spdk_zipf_generate(entry->zipf);
@@ -1909,10 +1970,14 @@ traffic_send(struct traffic_core *tc, uint32_t qi, uint64_t sched, struct perf_t
 	if (spdk_unlikely(rc != 0)) {
 		RATELIMIT_LOG("traffic: starting I/O failed: %d\n", rc);
 		tc->errors++;
-		TAILQ_INSERT_HEAD(&tc->free_tasks, task, link);
+		TAILQ_INSERT_HEAD(&tc->free_cls[cls], task, link);
 		return;
 	}
 	q->inflight++;
+	tc->inflight++;
+	if (tc->inflight > tc->inflight_max) {
+		tc->inflight_max = tc->inflight;
+	}
 	ns_ctx->current_queue_depth++;
 	ns_ctx->stats.io_submitted++;
 	tc->posted++;
@@ -1929,8 +1994,19 @@ traffic_ready_push(struct traffic_core *tc, uint32_t qi)
 	tc->ready_count++;
 }
 
+static uint32_t
+traffic_ready_pop(struct traffic_core *tc)
+{
+	uint32_t qi = tc->ready[tc->ready_head];
+
+	tc->ready_head = (tc->ready_head + 1) % tc->nq;
+	tc->ready_count--;
+	tc->q[qi].in_ready = false;
+	return qi;
+}
+
 static void
-traffic_backlog_push(struct traffic_core *tc, uint32_t qi, uint64_t sched)
+traffic_backlog_push(struct traffic_core *tc, uint32_t qi, uint64_t sched, uint32_t cls)
 {
 	struct traffic_queue *q = &tc->q[qi];
 
@@ -1939,13 +2015,13 @@ traffic_backlog_push(struct traffic_core *tc, uint32_t qi, uint64_t sched)
 		return;
 	}
 	if (q->ring == NULL) {
-		q->ring = malloc(sizeof(uint64_t) * g_traffic_backlog);
+		q->ring = malloc(sizeof(*q->ring) * g_traffic_backlog);
 		if (q->ring == NULL) {
 			tc->dropped++;
 			return;
 		}
 	}
-	q->ring[(q->head + q->count) % g_traffic_backlog] = sched;
+	q->ring[(q->head + q->count) % g_traffic_backlog] = (struct traffic_wait) { sched, cls };
 	q->count++;
 	tc->waited++;
 	if (q->count > tc->backlog_max) {
@@ -1953,35 +2029,35 @@ traffic_backlog_push(struct traffic_core *tc, uint32_t qi, uint64_t sched)
 	}
 }
 
-/* Queues that have a free slot and a backlog get the free tasks, in turn. */
+/*
+ * Queues with a free slot and a backlog take free tasks in turn. A queue whose
+ * oldest command finds no free task of its size goes back to the end, so a
+ * shortage of one size does not hold up the others; each call looks at every
+ * waiting queue at most once.
+ */
 static void
 traffic_serve(struct traffic_core *tc)
 {
 	struct traffic_queue	*q;
 	struct perf_task	*task;
-	uint64_t		sched;
-	uint32_t		qi;
+	struct traffic_wait	w;
+	uint32_t		qi, n;
 
-	while (tc->ready_count > 0) {
-		qi = tc->ready[tc->ready_head];
+	for (n = tc->ready_count; n > 0 && tc->ready_count > 0; n--) {
+		qi = traffic_ready_pop(tc);
 		q = &tc->q[qi];
 		if (q->count == 0 || q->inflight >= (uint32_t)g_queue_depth || q->ns_ctx->is_draining) {
-			tc->ready_head = (tc->ready_head + 1) % tc->nq;
-			tc->ready_count--;
-			q->in_ready = false;
 			continue;
 		}
-		task = traffic_get_task(tc, q->ns_ctx);
+		w = q->ring[q->head];
+		task = traffic_get_task(tc, w.cls);
 		if (task == NULL) {
-			return;
+			traffic_ready_push(tc, qi);
+			continue;
 		}
-		tc->ready_head = (tc->ready_head + 1) % tc->nq;
-		tc->ready_count--;
-		q->in_ready = false;
-		sched = q->ring[q->head];
 		q->head = (q->head + 1) % g_traffic_backlog;
 		q->count--;
-		traffic_send(tc, qi, sched, task);
+		traffic_send(tc, qi, w.sched, w.cls, task);
 		if (q->count > 0 && q->inflight < (uint32_t)g_queue_depth) {
 			traffic_ready_push(tc, qi);
 		}
@@ -1993,23 +2069,25 @@ traffic_arrival(struct traffic_core *tc, uint32_t qi, uint64_t sched)
 {
 	struct traffic_queue	*q = &tc->q[qi];
 	struct perf_task	*task;
+	uint32_t		cls;
 
 	tc->arrivals++;
 	if (q->ns_ctx->is_draining) {
 		return;
 	}
+	cls = traffic_draw_cls(q->ns_ctx->entry);
 	if (q->count == 0 && q->inflight < (uint32_t)g_queue_depth) {
-		task = traffic_get_task(tc, q->ns_ctx);
+		task = traffic_get_task(tc, cls);
 		if (task != NULL) {
-			traffic_send(tc, qi, sched, task);
+			traffic_send(tc, qi, sched, cls, task);
 			return;
 		}
-		/* The queue has room but the core has no free task. */
-		traffic_backlog_push(tc, qi, sched);
+		/* The queue has room but the core has no free task of this size. */
+		traffic_backlog_push(tc, qi, sched, cls);
 		traffic_ready_push(tc, qi);
 		return;
 	}
-	traffic_backlog_push(tc, qi, sched);
+	traffic_backlog_push(tc, qi, sched, cls);
 }
 
 static void
@@ -2021,9 +2099,16 @@ traffic_complete(struct perf_task *task)
 
 	spdk_histogram_data_tally(tc->hist_sched, now - task->sched_tsc);
 	spdk_histogram_data_tally(tc->hist_svc, now - task->submit_tsc);
+	if (g_mix_n > 0) {
+		spdk_histogram_data_tally(tc->hist_cls[task->size_cls], now - task->sched_tsc);
+		tc->bytes += g_mix_bytes[task->size_cls];
+	} else {
+		tc->bytes += g_io_size_bytes;
+	}
 	tc->completed++;
 	q->inflight--;
-	TAILQ_INSERT_HEAD(&tc->free_tasks, task, link);
+	tc->inflight--;
+	TAILQ_INSERT_HEAD(&tc->free_cls[task->size_cls], task, link);
 	if (q->count > 0) {
 		traffic_ready_push(tc, task->tq);
 	}
@@ -2056,8 +2141,13 @@ traffic_reset_stats(struct traffic_core *tc)
 	tc->dropped = 0;
 	tc->errors = 0;
 	tc->backlog_max = 0;
+	tc->inflight_max = tc->inflight;
 	spdk_histogram_data_reset(tc->hist_sched);
 	spdk_histogram_data_reset(tc->hist_svc);
+	for (uint32_t i = 0; i < g_mix_n; i++) {
+		spdk_histogram_data_reset(tc->hist_cls[i]);
+	}
+	tc->bytes = 0;
 }
 
 static int
@@ -2147,7 +2237,9 @@ traffic_setup(void)
 			goto out;
 		}
 		worker->tc = tc;
-		TAILQ_INIT(&tc->free_tasks);
+		for (i = 0; i < PERF_MAX_SIZE_MIX; i++) {
+			TAILQ_INIT(&tc->free_cls[i]);
+		}
 		TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
 			nq += g_nr_io_queues_per_ns;
 		}
@@ -2161,6 +2253,13 @@ traffic_setup(void)
 			rc = -ENOMEM;
 			goto out;
 		}
+		for (i = 0; i < g_mix_n; i++) {
+			tc->hist_cls[i] = spdk_histogram_data_alloc();
+			if (tc->hist_cls[i] == NULL) {
+				rc = -ENOMEM;
+				goto out;
+			}
+		}
 		k = 0;
 		TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
 			ns_ctx->tc = tc;
@@ -2173,6 +2272,21 @@ traffic_setup(void)
 		}
 		if (nq == 0) {
 			continue;
+		}
+		/* Buffers per size class: the class's share of the pool, at least 64. */
+		for (i = 0; i < (g_mix_n ? g_mix_n : 1); i++) {
+			uint32_t share = g_mix_n ? g_mix_cum[i] - (i ? g_mix_cum[i - 1] : 0) : 100000;
+			uint32_t want = spdk_max(64u, (uint32_t)((uint64_t)g_traffic_pool * share / 100000));
+			struct ns_worker_ctx *first_ctx = TAILQ_FIRST(&worker->ns_ctx);
+
+			g_alloc_io_bytes = g_mix_n ? g_mix_bytes[i] : 0;
+			for (k = 0; k < want; k++) {
+				struct perf_task *task = allocate_task(first_ctx, (int)k);
+
+				TAILQ_INSERT_TAIL(&tc->free_cls[i], task, link);
+				tc->tasks++;
+			}
+			g_alloc_io_bytes = 0;
 		}
 		tc->engine = perf_traffic_create(g_traffic_spec, tc->global_ids, nq, total, g_traffic_rate,
 						 g_tsc_rate, 0, traffic_core_seed(worker), err, sizeof(err));
@@ -2253,7 +2367,7 @@ traffic_print(void)
 		dropped += tc->dropped;
 		errors += tc->errors;
 		backlog_max = spdk_max(backlog_max, tc->backlog_max);
-		tasks_max = spdk_max(tasks_max, tc->tasks);
+		tasks_max = spdk_max(tasks_max, tc->inflight_max);
 		if (tc->engine != NULL) {
 			offered = g_traffic_bursty ? perf_traffic_offered(tc->engine) :
 				  offered + perf_traffic_offered(tc->engine);
@@ -2277,6 +2391,35 @@ traffic_print(void)
 	printf("TRAFFIC_RESULT SUBMIT_ERRORS %" PRIu64 "\n", errors);
 	printf("TRAFFIC_RESULT QUEUES %u\n", g_traffic_total_queues);
 	printf("TRAFFIC_RESULT CLIENTS %d\n", g_num_namespaces);
+	{
+		uint64_t bytes = 0;
+
+		TAILQ_FOREACH(worker, &g_workers, link) {
+			if (worker->tc != NULL) {
+				bytes += worker->tc->bytes;
+			}
+		}
+		printf("TRAFFIC_RESULT MIBPS %.1f\n", bytes / secs / (1024 * 1024));
+	}
+	for (uint32_t m = 0; m < g_mix_n; m++) {
+		struct spdk_histogram_data *hc = spdk_histogram_data_alloc();
+		double pc[5] = {0};
+
+		if (hc == NULL) {
+			break;
+		}
+		TAILQ_FOREACH(worker, &g_workers, link) {
+			if (worker->tc != NULL) {
+				spdk_histogram_data_merge(hc, worker->tc->hist_cls[m]);
+			}
+		}
+		ctx = (struct traffic_pct_ctx) { cut, pc, 5, 0 };
+		spdk_histogram_data_iterate(hc, traffic_pct_cb, &ctx);
+		for (i = 0; i < 5; i++) {
+			printf("TRAFFIC_RESULT %s_SCHED_US_%u %.3f\n", name[i], g_mix_bytes[m], pc[i]);
+		}
+		spdk_histogram_data_free(hc);
+	}
 	for (i = 0; i < 5; i++) {
 		printf("TRAFFIC_RESULT %s_SCHED_US %.3f\n", name[i], ps[i]);
 	}
@@ -2867,7 +3010,12 @@ usage(char *program_name)
 	printf("\t--traffic-rate <iops>    fixed: specs, commands per second per core\n");
 	printf("\t--workload-seed <n>      seed of the traffic (default: 1)\n");
 	printf("\t--traffic-backlog <n>    commands that may wait per queue (default: 1024)\n");
-	printf("\t--traffic-pool <n>       command buffers per core (default: 16384)\n");
+	printf("\t--traffic-pool <n>       command buffers per core, allocated before the run and\n");
+	printf("\t                         split by --io-size-mix share, >= 64 per size (default: 2048)\n");
+	printf("\t--rdma-cm-timeout <ms>   wait for each RDMA-CM event (default 1000); raise for\n");
+	printf("\t                         thousands of queues, which the target accepts slowly\n");
+	printf("\t--io-size-mix <b>:<pct>,...  each command draws its size (overrides -o); with\n");
+	printf("\t                         --traffic, latency is also reported per size\n");
 	printf("\t-N, --no-shst-notification no shutdown notification process for controllers, default: disabled\n");
 	printf("\t-Q, --continue-on-error <val> Do not stop on error. Log I/O errors every N times (default: 1)\n");
 	spdk_log_usage(stdout, "\t-T");
@@ -3375,6 +3523,10 @@ static const struct option g_perf_cmdline_opts[] = {
 	{"traffic-backlog",			required_argument,	NULL, PERF_TRAFFIC_BACKLOG},
 #define PERF_TRAFFIC_POOL	294
 	{"traffic-pool",			required_argument,	NULL, PERF_TRAFFIC_POOL},
+#define PERF_IO_SIZE_MIX	295
+	{"io-size-mix",				required_argument,	NULL, PERF_IO_SIZE_MIX},
+#define PERF_RDMA_CM_TIMEOUT	296
+	{"rdma-cm-timeout",			required_argument,	NULL, PERF_RDMA_CM_TIMEOUT},
 	/* Should be the last element */
 	{0, 0, 0, 0}
 };
@@ -3660,6 +3812,50 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 			}
 			g_traffic_pool = (uint32_t)val;
 			break;
+		case PERF_RDMA_CM_TIMEOUT:
+			val = spdk_strtol(optarg, 10);
+			if (val < 1 || val > 65535) {
+				fprintf(stderr, "--rdma-cm-timeout must be 1-65535 ms\n");
+				return 1;
+			}
+			g_rdma_cm_timeout_ms = (uint32_t)val;
+			break;
+		case PERF_IO_SIZE_MIX: {
+			char *dup = strdup(optarg), *tok, *save = NULL;
+			uint64_t cum = 0;
+
+			g_mix_n = 0;
+			for (tok = strtok_r(dup, ",", &save); tok != NULL; tok = strtok_r(NULL, ",", &save)) {
+				char *colon = strchr(tok, ':');
+				double pct;
+				long bytes;
+
+				if (colon == NULL || g_mix_n == PERF_MAX_SIZE_MIX) {
+					fprintf(stderr, "--io-size-mix: <bytes>:<percent>,... (at most %d)\n",
+						PERF_MAX_SIZE_MIX);
+					free(dup);
+					return 1;
+				}
+				*colon = '\0';
+				bytes = spdk_strtol(tok, 10);
+				pct = strtod(colon + 1, NULL);
+				if (bytes < 512 || bytes % 512 != 0 || pct <= 0) {
+					fprintf(stderr, "--io-size-mix: bad entry %s:%s\n", tok, colon + 1);
+					free(dup);
+					return 1;
+				}
+				cum += (uint64_t)(pct * 1000 + 0.5);
+				g_mix_bytes[g_mix_n] = (uint32_t)bytes;
+				g_mix_cum[g_mix_n] = (uint32_t)cum;
+				g_mix_n++;
+			}
+			free(dup);
+			if (cum != 100000) {
+				fprintf(stderr, "--io-size-mix: percents add up to %.3f, not 100\n", cum / 1000.0);
+				return 1;
+			}
+			break;
+		}
 		case PERF_NO_SHST_NOTIFICATION:
 			g_no_shn_notification = true;
 			break;
@@ -3776,6 +3972,14 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 		return 1;
 	}
 
+	if (g_mix_n > 0) {
+		/* Buffers and the LBA stride are sized for the largest command. */
+		g_io_size_bytes = 0;
+		for (uint32_t m = 0; m < g_mix_n; m++) {
+			g_io_size_bytes = spdk_max(g_io_size_bytes, g_mix_bytes[m]);
+		}
+	}
+
 	if (g_traffic_spec != NULL) {
 		if (g_burst_pct > 0 || g_total_iops > 0 || g_zcopy || g_number_ios) {
 			fprintf(stderr, "--traffic does not combine with --burst-pct, --total-iops, -Z "
@@ -3876,10 +4080,13 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 		return 1;
 	}
 
-	if (g_rdma_srq_size != 0 || g_rdma_xrc) {
+	if (g_rdma_srq_size != 0 || g_rdma_xrc || g_rdma_cm_timeout_ms != 0) {
 		struct spdk_nvme_transport_opts opts;
 
 		spdk_nvme_transport_get_opts(&opts, sizeof(opts));
+		if (g_rdma_cm_timeout_ms != 0) {
+			opts.rdma_cm_event_timeout_ms = (uint16_t)g_rdma_cm_timeout_ms;
+		}
 		if (g_rdma_srq_size != 0) {
 			opts.rdma_srq_size = g_rdma_srq_size;
 		}
