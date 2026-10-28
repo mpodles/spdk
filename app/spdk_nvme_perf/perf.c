@@ -3013,7 +3013,8 @@ usage(char *program_name)
 	printf("\t--traffic-pool <n>       command buffers per core, allocated before the run and\n");
 	printf("\t                         split by --io-size-mix share, >= 64 per size (default: 2048)\n");
 	printf("\t--rdma-cm-timeout <ms>   wait for each RDMA-CM event (default 1000); raise for\n");
-	printf("\t                         thousands of queues, which the target accepts slowly\n");
+	printf("\t                         thousands of queues, which the target accepts slowly;\n");
+	printf("\t                         also the Fabrics CONNECT timeout (default 500 ms)\n");
 	printf("\t--io-size-mix <b>:<pct>,...  each command draws its size (overrides -o); with\n");
 	printf("\t                         --traffic, latency is also reported per size\n");
 	printf("\t-N, --no-shst-notification no shutdown notification process for controllers, default: disabled\n");
@@ -4200,6 +4201,11 @@ probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	opts->header_digest = g_header_digest;
 	opts->data_digest = g_data_digest;
 	opts->keep_alive_timeout_ms = g_keep_alive_timeout_in_ms;
+	if (g_rdma_cm_timeout_ms != 0) {
+		/* With thousands of queues the target answers Fabrics CONNECTs late too:
+		 * give them the CM timeout (SPDK default 500 ms). */
+		opts->fabrics_connect_timeout_us = (uint64_t)g_rdma_cm_timeout_ms * 1000;
+	}
 	opts->tls_psk = g_psk;
 	memcpy(opts->hostnqn, trid_entry->hostnqn, sizeof(opts->hostnqn));
 
