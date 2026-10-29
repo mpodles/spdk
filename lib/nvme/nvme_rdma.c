@@ -1077,9 +1077,12 @@ struct nvme_rdma_xrc_session {
 	bool				dead;
 	uint32_t			num_workers;
 	uint32_t			srqn[SPDK_NVMF_RDMA_XRC_MAX_WORKERS];
-	uint32_t			ini_qpn[SPDK_NVMF_RDMA_XRC_MAX_WORKERS];
-	struct ibv_qp			*tgt_qp[SPDK_NVMF_RDMA_XRC_MAX_WORKERS];
-	uint32_t			tgt_qpn[SPDK_NVMF_RDMA_XRC_MAX_WORKERS];
+	/* One TGT QP per target INI QP: per poll group, or two per poll group when the
+	 * target sends large transfers on their own INI QP (num_tgt = 2 * num_workers). */
+	uint32_t			num_tgt;
+	uint32_t			ini_qpn[SPDK_NVMF_RDMA_XRC_MAX_INI];
+	struct ibv_qp			*tgt_qp[SPDK_NVMF_RDMA_XRC_MAX_INI];
+	uint32_t			tgt_qpn[SPDK_NVMF_RDMA_XRC_MAX_INI];
 	/* Queue by qid, for matching responses by SQID. */
 	uint32_t			max_qid;
 	struct nvme_rdma_qpair		**qpairs;
@@ -1226,7 +1229,7 @@ nvme_rdma_xrc_session_put(struct nvme_rdma_ctrlr *rctrlr, struct nvme_rdma_xrc_s
 	if (--session->refcnt > 0) {
 		return;
 	}
-	for (i = 0; i < session->num_workers; i++) {
+	for (i = 0; i < session->num_tgt; i++) {
 		if (session->tgt_qp[i] != NULL && ibv_destroy_qp(session->tgt_qp[i])) {
 			SPDK_ERRLOG("XRC: ibv_destroy_qp(TGT) failed: %s\n", spdk_strerror(errno));
 		}
@@ -1442,7 +1445,7 @@ nvme_rdma_xrc_qp_error(struct nvme_rdma_qpair *rqpair)
 	}
 }
 
-/* TGT QP for target poll group w: RTR towards the target INI QP (w, us). */
+/* TGT QP w: RTR towards target INI QP w (poll group w % num_workers, us). */
 static int
 nvme_rdma_xrc_tgt_create(struct nvme_rdma_qpair *rqpair, uint32_t w, struct ibv_qp_attr *cm_rtr)
 {
@@ -1504,18 +1507,21 @@ nvme_rdma_xrc_complete_connect(struct nvme_rdma_qpair *rqpair, struct rdma_cm_ev
 	struct nvme_rdma_xrc_session *session = rqpair->xrc_session;
 	const struct spdk_nvmf_rdma_xrc_accept_private_data *pd = event->param.conn.private_data;
 	struct ibv_qp_attr cm = {}, a = {};
-	uint32_t i, n;
+	uint32_t i, n, m;
 	int mask = 0;
 
 	if (pd == NULL || event->param.conn.private_data_len < sizeof(*pd) ||
-	    pd->xrc_magic != SPDK_NVMF_RDMA_XRC_MAGIC || pd->num_workers == 0 ||
-	    pd->num_workers > SPDK_NVMF_RDMA_XRC_MAX_WORKERS ||
-	    event->param.conn.private_data_len < sizeof(*pd) + 8u * pd->num_workers ||
+	    pd->xrc_magic != SPDK_NVMF_RDMA_XRC_MAGIC || pd->xrc_version != SPDK_NVMF_RDMA_XRC_VERSION ||
+	    pd->num_workers == 0 || pd->num_workers > SPDK_NVMF_RDMA_XRC_MAX_WORKERS ||
+	    (pd->num_ini != pd->num_workers && pd->num_ini != 2 * pd->num_workers) ||
+	    event->param.conn.private_data_len < sizeof(*pd) + 4u * (pd->num_workers + pd->num_ini) ||
 	    pd->home >= pd->num_workers) {
-		SPDK_ERRLOG("XRC: target did not accept XRC (no or bad XRC accept data)\n");
+		SPDK_ERRLOG("XRC: target did not accept XRC (no or bad XRC accept data, version %u)\n",
+			    pd != NULL && event->param.conn.private_data_len >= sizeof(*pd) ? pd->xrc_version : 0);
 		return -EPROTO;
 	}
 	n = pd->num_workers;
+	m = pd->num_ini;
 
 	cm.qp_state = IBV_QPS_RTR;
 	if (rdma_init_qp_attr(rqpair->cm_id, &cm, &mask)) {
@@ -1525,25 +1531,30 @@ nvme_rdma_xrc_complete_connect(struct nvme_rdma_qpair *rqpair, struct rdma_cm_ev
 
 	if (!session->have_target) {
 		session->num_workers = n;
+		session->num_tgt = m;
 		for (i = 0; i < n; i++) {
 			session->srqn[i] = pd->data[i];
+		}
+		for (i = 0; i < m; i++) {
 			session->ini_qpn[i] = pd->data[n + i];
 		}
-		for (i = 0; i < n; i++) {
+		for (i = 0; i < m; i++) {
 			if (nvme_rdma_xrc_tgt_create(rqpair, i, &cm)) {
 				return -EIO;
 			}
 		}
 		session->have_target = true;
-		SPDK_NOTICELOG("XRC: session 0x%" PRIx64 ": target has %u workers\n", session->id, n);
+		SPDK_NOTICELOG("XRC: session 0x%" PRIx64 ": target has %u workers, %u INI QPs\n",
+			       session->id, n, m);
 	} else {
-		if (n != session->num_workers) {
-			SPDK_ERRLOG("XRC: target worker count changed (%u -> %u)\n", session->num_workers, n);
+		if (n != session->num_workers || m != session->num_tgt) {
+			SPDK_ERRLOG("XRC: target worker or INI QP count changed (%u/%u -> %u/%u)\n",
+				    session->num_workers, session->num_tgt, n, m);
 			nvme_rdma_xrc_session_fail(session, "target worker count changed");
 			return -EPROTO;
 		}
-		for (i = 0; i < n; i++) {
-			if (session->srqn[i] != pd->data[i] || session->ini_qpn[i] != pd->data[n + i]) {
+		for (i = 0; i < m; i++) {
+			if ((i < n && session->srqn[i] != pd->data[i]) || session->ini_qpn[i] != pd->data[n + i]) {
 				SPDK_ERRLOG("XRC: target topology of session 0x%" PRIx64 " changed\n", session->id);
 				nvme_rdma_xrc_session_fail(session, "target topology changed");
 				return -EPROTO;
@@ -1663,9 +1674,9 @@ nvme_rdma_xrc_fill_connect(struct nvme_rdma_qpair *rqpair, struct nvme_request *
 	}
 	ext.xrc_magic = SPDK_NVMF_RDMA_XRC_MAGIC;
 	ext.xrc_version = SPDK_NVMF_RDMA_XRC_VERSION;
-	ext.num_tgt = session->num_workers;
+	ext.num_tgt = session->num_tgt;
 	ext.session_id = session->id;
-	memcpy(ext.tgt_qpn, session->tgt_qpn, sizeof(uint32_t) * session->num_workers);
+	memcpy(ext.tgt_qpn, session->tgt_qpn, sizeof(uint32_t) * session->num_tgt);
 	data = (uint8_t *)req->payload.contig_or_cb_arg + req->payload_offset;
 	memcpy(data + SPDK_NVMF_RDMA_XRC_CONNECT_EXT_OFFSET, &ext, sizeof(ext));
 	return 0;
@@ -1681,7 +1692,7 @@ nvme_rdma_xrc_qpair_from_wc(struct nvme_rdma_poller *poller, struct ibv_wc *wc,
 
 	for (s = 0; s < poller->xrc_num_sessions; s++) {
 		session = poller->xrc_sessions[s];
-		for (i = 0; i < session->num_workers; i++) {
+		for (i = 0; i < session->num_tgt; i++) {
 			if (session->tgt_qpn[i] == wc->qp_num) {
 				return cpl->sqid <= session->max_qid ? session->qpairs[cpl->sqid] : NULL;
 			}
@@ -1699,7 +1710,7 @@ nvme_rdma_xrc_tgt_failed(struct nvme_rdma_poller *poller, uint32_t qp_num)
 
 	for (s = 0; s < poller->xrc_num_sessions; s++) {
 		session = poller->xrc_sessions[s];
-		for (i = 0; i < session->num_workers; i++) {
+		for (i = 0; i < session->num_tgt; i++) {
 			if (session->tgt_qpn[i] == qp_num) {
 				nvme_rdma_xrc_session_fail(session, "TGT QP in error");
 				return;

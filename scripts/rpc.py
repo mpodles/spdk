@@ -2652,6 +2652,7 @@ Format: 'user:u1 secret:s1 muser:mu1 msecret:ms1,user:u2 secret:s2 muser:mu2 mse
     p.add_argument('--xrc', action='store_true', help='Serve hosts that ask for XRC I/O queues (commands of a queue on any poll group). Relevant only for RDMA transport')
     p.add_argument('--xrc-srq-depth', help='XRC command SRQ depth per poll group (default: max SRQ depth). Relevant only for RDMA transport', type=int)
     p.add_argument('--xrc-ini-send-depth', help='Send queue depth of each XRC INI QP (poll group, host). Relevant only for RDMA transport', type=int)
+    p.add_argument('--xrc-large-threshold', help='XRC: requests with more data than this (bytes) use a second INI QP per poll group (default 16384, 0: one INI QP). Relevant only for RDMA transport', type=int)
     p.add_argument('-e', '--control-msg-num', help="""The number of control messages per poll group.
     Relevant only for TCP transport""", type=int)
     p.add_argument('-M', '--disable-mappable-bar0', action='store_true', help="""Disable mmap() of BAR0.

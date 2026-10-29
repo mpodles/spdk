@@ -54,10 +54,14 @@
 #include "spdk/assert.h"
 
 #define SPDK_NVMF_RDMA_XRC_MAGIC	0x5852	/* "XR" */
-#define SPDK_NVMF_RDMA_XRC_VERSION	1
+/* 2: the target may give each poll group a second INI QP for large transfers. */
+#define SPDK_NVMF_RDMA_XRC_VERSION	2
 
-/* REP private data is at most 196 bytes: 32 + 8 * W. */
+/* REP private data is at most 196 bytes: 32 + 4 * W SRQNs + 4 * (INI QPs). */
+#define SPDK_NVMF_RDMA_XRC_REP_MAX	196
 #define SPDK_NVMF_RDMA_XRC_MAX_WORKERS	20
+/* INI QPs per session: one per poll group, or two (small and large transfers). */
+#define SPDK_NVMF_RDMA_XRC_MAX_INI	(2 * SPDK_NVMF_RDMA_XRC_MAX_WORKERS)
 
 /* SQHD sent in every XRC response: commands of one queue complete on several
  * cores, and the SPDK host ignores SQHD on RDMA. */
@@ -110,10 +114,13 @@ struct __attribute__((packed)) spdk_nvmf_rdma_xrc_accept_private_data {
 	uint8_t		num_workers;
 	/* Index of the poll group that owns this queue (its home SRQ). */
 	uint8_t		home;
-	uint8_t		reserved1[3];
+	/* INI QPs: num_workers, or 2 * num_workers when transfers above the target's
+	 * threshold go on a second INI QP per poll group (ini_qpn[num_workers + w]). */
+	uint8_t		num_ini;
+	uint8_t		reserved1[2];
 	uint32_t	tgt_qpn;
 	uint8_t		reserved2[16];
-	/* Followed by uint32_t srqn[num_workers], uint32_t ini_qpn[num_workers]. */
+	/* Followed by uint32_t srqn[num_workers], uint32_t ini_qpn[num_ini]. */
 	uint32_t	data[];
 };
 SPDK_STATIC_ASSERT(sizeof(struct spdk_nvmf_rdma_xrc_accept_private_data) == 32,
@@ -125,7 +132,8 @@ struct __attribute__((packed)) spdk_nvmf_rdma_xrc_connect_ext {
 	uint8_t		xrc_version;
 	uint8_t		num_tgt;
 	uint64_t	session_id;
-	uint32_t	tgt_qpn[SPDK_NVMF_RDMA_XRC_MAX_WORKERS];
+	/* One host TGT QP per target INI QP, in the order of the accept data. */
+	uint32_t	tgt_qpn[SPDK_NVMF_RDMA_XRC_MAX_INI];
 };
 SPDK_STATIC_ASSERT(sizeof(struct spdk_nvmf_rdma_xrc_connect_ext) <= 238, "Incorrect size");
 
