@@ -587,6 +587,12 @@ spdk_rdma_provider_cq_resize(struct spdk_rdma_provider_cq *rdma_cq, int cqe)
 	return spdk_mlx5_cq_resize(dv_cq->mlx5_cq, cqe);
 }
 
+const uint64_t *
+spdk_rdma_provider_cq_poll_ts(void)
+{
+	return NULL;
+}
+
 int
 spdk_rdma_provider_cq_poll(struct spdk_rdma_provider_cq *rdma_cq, int num_entries,
 			   struct ibv_wc *wc)

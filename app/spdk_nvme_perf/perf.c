@@ -31,6 +31,9 @@
 #include "spdk_internal/nvmf_rdma_xrc.h"
 #include "traffic_shim.h"
 
+/* lib/nvme/nvme_rdma.c: NIC timestamp of the response being completed (SPDK_RDMA_CQ_TS=1). */
+extern __thread uint64_t g_nvme_rdma_cqe_tsc;
+
 #ifdef SPDK_CONFIG_URING
 #include <liburing.h>
 #endif
@@ -257,6 +260,13 @@ struct traffic_core {
 	struct spdk_histogram_data *hist_sched;	/* completion - scheduled time */
 	struct spdk_histogram_data *hist_svc;	/* completion - submit */
 	struct spdk_histogram_data *hist_cls[PERF_MAX_SIZE_MIX]; /* scheduled time, per size */
+	/* With SPDK_RDMA_CQ_TS=1, per size: submit to the response's NIC completion (net),
+	 * NIC completion to perf seeing it (host), and submit to perf seeing it (svc). */
+	struct spdk_histogram_data *hist_net[PERF_MAX_SIZE_MIX];
+	struct spdk_histogram_data *hist_host[PERF_MAX_SIZE_MIX];
+	struct spdk_histogram_data *hist_svcc[PERF_MAX_SIZE_MIX];
+	uint64_t		nicts_ok;
+	uint64_t		nicts_missing;
 	/* bursty with more than one Burst class: scheduled time per class */
 	uint32_t		nbcls;
 	struct spdk_histogram_data *hist_bcls[PERF_MAX_BURST_CLASSES];
@@ -2099,6 +2109,9 @@ traffic_arrival(struct traffic_core *tc, uint32_t qi, uint64_t sched)
 	traffic_backlog_push(tc, qi, sched, cls);
 }
 
+/* Per size m: percentiles of the NIC-timestamp split (SPDK_RDMA_CQ_TS=1). */
+static void traffic_print_nicts(uint32_t m, const double *cut, const char **name);
+
 static void
 traffic_complete(struct perf_task *task)
 {
@@ -2114,6 +2127,18 @@ traffic_complete(struct perf_task *task)
 	if (g_mix_n > 0) {
 		spdk_histogram_data_tally(tc->hist_cls[task->size_cls], now - task->sched_tsc);
 		tc->bytes += g_mix_bytes[task->size_cls];
+		if (tc->hist_net[0] != NULL) {
+			uint64_t nic = g_nvme_rdma_cqe_tsc;
+
+			if (nic > task->submit_tsc && nic <= now) {
+				spdk_histogram_data_tally(tc->hist_net[task->size_cls], nic - task->submit_tsc);
+				spdk_histogram_data_tally(tc->hist_host[task->size_cls], now - nic);
+				spdk_histogram_data_tally(tc->hist_svcc[task->size_cls], now - task->submit_tsc);
+				tc->nicts_ok++;
+			} else {
+				tc->nicts_missing++;
+			}
+		}
 	} else {
 		tc->bytes += g_io_size_bytes;
 	}
@@ -2159,6 +2184,11 @@ traffic_reset_stats(struct traffic_core *tc)
 	spdk_histogram_data_reset(tc->hist_svc);
 	for (uint32_t i = 0; i < g_mix_n; i++) {
 		spdk_histogram_data_reset(tc->hist_cls[i]);
+		if (tc->hist_net[i] != NULL) {
+			spdk_histogram_data_reset(tc->hist_net[i]);
+			spdk_histogram_data_reset(tc->hist_host[i]);
+			spdk_histogram_data_reset(tc->hist_svcc[i]);
+		}
 	}
 	for (uint32_t i = 0; i < tc->nbcls && tc->nbcls > 1; i++) {
 		spdk_histogram_data_reset(tc->hist_bcls[i]);
@@ -2282,6 +2312,15 @@ traffic_setup(void)
 				rc = -ENOMEM;
 				goto out;
 			}
+			if (getenv("SPDK_RDMA_CQ_TS") != NULL && strcmp(getenv("SPDK_RDMA_CQ_TS"), "1") == 0) {
+				tc->hist_net[i] = spdk_histogram_data_alloc();
+				tc->hist_host[i] = spdk_histogram_data_alloc();
+				tc->hist_svcc[i] = spdk_histogram_data_alloc();
+				if (!tc->hist_net[i] || !tc->hist_host[i] || !tc->hist_svcc[i]) {
+					rc = -ENOMEM;
+					goto out;
+				}
+			}
 		}
 		k = 0;
 		TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
@@ -2388,6 +2427,51 @@ traffic_pct_cb(void *ctx, uint64_t start, uint64_t end, uint64_t count, uint64_t
 	}
 	while (p->i < p->n && (double)so_far / total >= p->cut[p->i]) {
 		p->out[p->i++] = (double)end * 1000 * 1000 / g_tsc_rate;
+	}
+}
+
+static void
+traffic_print_nicts(uint32_t m, const double *cut, const char **name)
+{
+	static const char *part[] = {"NET", "HOST", "SVC"};
+	struct worker_thread *worker;
+	struct traffic_pct_ctx ctx;
+	uint64_t ok = 0, missing = 0;
+	int k, i;
+
+	for (k = 0; k < 3; k++) {
+		struct spdk_histogram_data *h = spdk_histogram_data_alloc();
+		double pc[5] = {0};
+
+		if (h == NULL) {
+			return;
+		}
+		TAILQ_FOREACH(worker, &g_workers, link) {
+			struct traffic_core *tc = worker->tc;
+
+			if (tc == NULL || tc->hist_net[m] == NULL) {
+				continue;
+			}
+			spdk_histogram_data_merge(h, k == 0 ? tc->hist_net[m] : k == 1 ? tc->hist_host[m] :
+						  tc->hist_svcc[m]);
+			if (k == 0 && m == 0) {
+				ok += tc->nicts_ok;
+				missing += tc->nicts_missing;
+			}
+		}
+		ctx = (struct traffic_pct_ctx) { cut, pc, 5, 0 };
+		spdk_histogram_data_iterate(h, traffic_pct_cb, &ctx);
+		spdk_histogram_data_free(h);
+		if (pc[0] == 0) {
+			continue;
+		}
+		for (i = 0; i < 5; i++) {
+			printf("TRAFFIC_RESULT %s_%s_US_%u %.3f\n", name[i], part[k], g_mix_bytes[m], pc[i]);
+		}
+	}
+	if (m == 0 && ok + missing > 0) {
+		printf("TRAFFIC_RESULT NICTS_OK %" PRIu64 "\nTRAFFIC_RESULT NICTS_MISSING %" PRIu64 "\n",
+		       ok, missing);
 	}
 }
 
@@ -2556,6 +2640,7 @@ traffic_print(void)
 			printf("TRAFFIC_RESULT %s_SCHED_US_%u %.3f\n", name[i], g_mix_bytes[m], pc[i]);
 		}
 		spdk_histogram_data_free(hc);
+		traffic_print_nicts(m, cut, name);
 	}
 	traffic_print_queues(cut, name, secs);
 	for (i = 0; i < 5; i++) {

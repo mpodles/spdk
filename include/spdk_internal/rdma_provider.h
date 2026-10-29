@@ -268,6 +268,16 @@ int spdk_rdma_provider_cq_resize(struct spdk_rdma_provider_cq *rdma_cq, int cqe)
 int spdk_rdma_provider_cq_poll(struct spdk_rdma_provider_cq *rdma_cq, int num_entries,
 			       struct ibv_wc *wc);
 
+/** Most completions spdk_rdma_provider_cq_poll_ts() reports per poll. */
+#define SPDK_RDMA_PROVIDER_CQ_TS_MAX 256
+
+/**
+ * NIC completion timestamps of the last spdk_rdma_provider_cq_poll() on this thread, in
+ * spdk_get_ticks() units, one per returned completion (0: unknown). NULL unless CQs were
+ * created with SPDK_RDMA_CQ_TS=1 in the environment (verbs provider only; a measurement aid).
+ */
+const uint64_t *spdk_rdma_provider_cq_poll_ts(void);
+
 /**
  * Check whether RDMA provider supports accel sequences
  *

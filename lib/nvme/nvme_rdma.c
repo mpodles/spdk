@@ -3654,6 +3654,11 @@ nvme_rdma_request_ready(struct nvme_rdma_qpair *rqpair, struct spdk_nvme_rdma_re
 
 #define MAX_COMPLETIONS_PER_POLL 128
 
+/* NIC timestamp (spdk_get_ticks() units) of the response completion being processed on this
+ * thread, 0 when unknown. Only set when the RDMA provider timestamps CQs (SPDK_RDMA_CQ_TS=1);
+ * spdk_nvme_perf reads it to split a command's latency into host and network parts. */
+__thread uint64_t g_nvme_rdma_cqe_tsc;
+
 static void
 nvme_rdma_fail_qpair(struct spdk_nvme_qpair *qpair, int failure_reason)
 {
@@ -3929,6 +3934,8 @@ nvme_rdma_cq_process_completions(struct spdk_rdma_provider_cq *cq, uint32_t batc
 	int				completion_rc = 0;
 	int				rc, _rc, i;
 
+	const uint64_t			*ts;
+
 	rc = spdk_rdma_provider_cq_poll(cq, batch_size, wc);
 	if (spdk_unlikely(rc < 0)) {
 		SPDK_ERRLOG("Error polling CQ! (%d): %s\n",
@@ -3937,6 +3944,7 @@ nvme_rdma_cq_process_completions(struct spdk_rdma_provider_cq *cq, uint32_t batc
 	} else if (rc == 0) {
 		return 0;
 	}
+	ts = spdk_rdma_provider_cq_poll_ts();
 
 	for (i = 0; i < rc; i++) {
 		rdma_wr = (struct nvme_rdma_wr *)wc[i].wr_id;
@@ -3947,7 +3955,9 @@ nvme_rdma_cq_process_completions(struct spdk_rdma_provider_cq *cq, uint32_t batc
 
 		switch (rdma_wr->type) {
 		case RDMA_WR_TYPE_RECV:
+			g_nvme_rdma_cqe_tsc = ts != NULL ? ts[i] : 0;
 			_rc = nvme_rdma_process_recv_completion(poller, &wc[i], rdma_wr);
+			g_nvme_rdma_cqe_tsc = 0;
 			break;
 
 		case RDMA_WR_TYPE_SEND:

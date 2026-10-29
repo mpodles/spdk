@@ -13,6 +13,7 @@
 #include "spdk_internal/rdma_provider.h"
 #include "spdk_internal/rdma_utils.h"
 #include "spdk/log.h"
+#include "spdk/env.h"
 
 struct spdk_rdma_provider_qp *
 spdk_rdma_provider_qp_create(struct rdma_cm_id *cm_id,
@@ -335,36 +336,146 @@ spdk_rdma_provider_accel_sequence_supported(void)
 	return false;
 }
 
+/* A CQ with NIC completion timestamps (SPDK_RDMA_CQ_TS=1): the NIC clock is mapped to
+ * spdk_get_ticks() by sampling both clocks every 20 ms. */
+struct verbs_cq {
+	struct spdk_rdma_provider_cq	base;
+	struct ibv_cq_ex		*ex;
+	struct ibv_context		*ctx;
+	double				ticks_per_cycle;
+	double				offset;
+	uint64_t			next_sync;
+};
+
+static __thread uint64_t g_cq_ts[SPDK_RDMA_PROVIDER_CQ_TS_MAX];
+static __thread bool g_cq_ts_valid;
+
+const uint64_t *
+spdk_rdma_provider_cq_poll_ts(void)
+{
+	return g_cq_ts_valid ? g_cq_ts : NULL;
+}
+
+static void
+verbs_cq_sync_clock(struct verbs_cq *vcq, uint64_t now)
+{
+	struct ibv_values_ex values = { .comp_mask = IBV_VALUES_MASK_RAW_CLOCK };
+	uint64_t t0, t1, raw;
+
+	t0 = spdk_get_ticks();
+	if (ibv_query_rt_values_ex(vcq->ctx, &values) != 0) {
+		return;
+	}
+	t1 = spdk_get_ticks();
+	raw = (uint64_t)values.raw_clock.tv_sec * 1000000000ULL + values.raw_clock.tv_nsec;
+	vcq->offset = (double)(t0 + t1) / 2 - (double)raw * vcq->ticks_per_cycle;
+	vcq->next_sync = now + spdk_get_ticks_hz() / 50;
+}
+
 struct spdk_rdma_provider_cq *
 spdk_rdma_provider_cq_create(struct spdk_rdma_provider_cq_init_attr *cq_attr)
 {
-	struct spdk_rdma_provider_cq *rdma_cq;
+	struct verbs_cq *vcq;
+	const char *ts = getenv("SPDK_RDMA_CQ_TS");
 
-	rdma_cq = calloc(1, sizeof(*rdma_cq));
-	if (!rdma_cq) {
+	vcq = calloc(1, sizeof(*vcq));
+	if (!vcq) {
 		SPDK_ERRLOG("CQ memory allocation failed\n");
 		return NULL;
 	}
 
-	rdma_cq->cq = ibv_create_cq(cq_attr->pd->context, cq_attr->cqe, cq_attr->cq_context,
-				    cq_attr->comp_channel,
-				    cq_attr->comp_vector);
-	if (!rdma_cq->cq) {
+	if (ts != NULL && strcmp(ts, "1") == 0) {
+		struct ibv_cq_init_attr_ex attr = {
+			.cqe = cq_attr->cqe,
+			.cq_context = cq_attr->cq_context,
+			.channel = cq_attr->comp_channel,
+			.comp_vector = cq_attr->comp_vector,
+			.wc_flags = IBV_WC_STANDARD_FLAGS | IBV_WC_EX_WITH_COMPLETION_TIMESTAMP,
+		};
+		struct ibv_device_attr_ex dattr = {};
+
+		if (ibv_query_device_ex(cq_attr->pd->context, NULL, &dattr) == 0 && dattr.hca_core_clock != 0) {
+			vcq->ex = ibv_create_cq_ex(cq_attr->pd->context, &attr);
+		}
+		if (vcq->ex != NULL) {
+			vcq->ctx = cq_attr->pd->context;
+			vcq->ticks_per_cycle = (double)spdk_get_ticks_hz() / ((double)dattr.hca_core_clock * 1000);
+			verbs_cq_sync_clock(vcq, spdk_get_ticks());
+			vcq->base.cq = ibv_cq_ex_to_cq(vcq->ex);
+			return &vcq->base;
+		}
+		SPDK_WARNLOG("SPDK_RDMA_CQ_TS: no timestamped CQ (errno %d), using a plain one\n", errno);
+	}
+
+	vcq->base.cq = ibv_create_cq(cq_attr->pd->context, cq_attr->cqe, cq_attr->cq_context,
+				     cq_attr->comp_channel,
+				     cq_attr->comp_vector);
+	if (!vcq->base.cq) {
 		SPDK_ERRLOG("Unable to create completion queue: errno %d: %s\n", errno, spdk_strerror(errno));
-		free(rdma_cq);
+		free(vcq);
 		return NULL;
 	}
 
-	return rdma_cq;
+	return &vcq->base;
 }
 
 void
 spdk_rdma_provider_cq_destroy(struct spdk_rdma_provider_cq *rdma_cq)
 {
+	struct verbs_cq *vcq = SPDK_CONTAINEROF(rdma_cq, struct verbs_cq, base);
+
 	assert(rdma_cq);
 
 	ibv_destroy_cq(rdma_cq->cq);
-	free(rdma_cq);
+	free(vcq);
+}
+
+static int
+verbs_cq_poll_ts(struct verbs_cq *vcq, int num_entries, struct ibv_wc *wc)
+{
+	struct ibv_poll_cq_attr attr = {};
+	struct ibv_cq_ex *ex = vcq->ex;
+	uint64_t now = spdk_get_ticks();
+	int n = 0, rc;
+
+	if (now >= vcq->next_sync) {
+		verbs_cq_sync_clock(vcq, now);
+	}
+	if (num_entries > SPDK_RDMA_PROVIDER_CQ_TS_MAX) {
+		num_entries = SPDK_RDMA_PROVIDER_CQ_TS_MAX;
+	}
+	rc = ibv_start_poll(ex, &attr);
+	if (rc == ENOENT) {
+		g_cq_ts_valid = true;
+		return 0;
+	} else if (rc != 0) {
+		return -rc;
+	}
+	do {
+		struct ibv_wc *w = &wc[n];
+
+		memset(w, 0, sizeof(*w));
+		w->wr_id = ex->wr_id;
+		w->status = ex->status;
+		w->opcode = ibv_wc_read_opcode(ex);
+		w->vendor_err = ibv_wc_read_vendor_err(ex);
+		w->byte_len = ibv_wc_read_byte_len(ex);
+		w->qp_num = ibv_wc_read_qp_num(ex);
+		w->src_qp = ibv_wc_read_src_qp(ex);
+		w->wc_flags = ibv_wc_read_wc_flags(ex);
+		if (w->wc_flags & IBV_WC_WITH_IMM) {
+			w->imm_data = ibv_wc_read_imm_data(ex);
+		}
+		w->slid = ibv_wc_read_slid(ex);
+		w->sl = ibv_wc_read_sl(ex);
+		w->dlid_path_bits = ibv_wc_read_dlid_path_bits(ex);
+		g_cq_ts[n] = (uint64_t)((double)ibv_wc_read_completion_ts(ex) * vcq->ticks_per_cycle + vcq->offset);
+		n++;
+	} while (n < num_entries && ibv_next_poll(ex) == 0);
+	ibv_end_poll(ex);
+	g_cq_ts_valid = true;
+
+	return n;
 }
 
 int
@@ -379,9 +490,15 @@ int
 spdk_rdma_provider_cq_poll(struct spdk_rdma_provider_cq *rdma_cq, int num_entries,
 			   struct ibv_wc *wc)
 {
+	struct verbs_cq *vcq = SPDK_CONTAINEROF(rdma_cq, struct verbs_cq, base);
+
 	assert(rdma_cq);
 	assert(wc);
 
+	if (vcq->ex != NULL) {
+		return verbs_cq_poll_ts(vcq, num_entries, wc);
+	}
+	g_cq_ts_valid = false;
 	return ibv_poll_cq(rdma_cq->cq, num_entries, wc);
 }
 
